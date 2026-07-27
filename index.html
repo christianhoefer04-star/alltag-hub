@@ -411,6 +411,17 @@ function activeTabs(){
 /* ===================== HELPERS ===================== */
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// Colour values end up inside style="..." attributes. Most come from our own
+// constants, but custom categories - and anything arriving via a backup
+// import or cloud sync - are attacker-controllable in principle. Escaping
+// alone would still permit CSS injection (e.g. `url(...)`), so colours are
+// validated against an allowlist of shapes instead and otherwise replaced by
+// a neutral grey. Anything that is not a plain hex / rgb() / var() is a bug
+// or an attack, and neither should be rendered.
+const COL=c=>{
+  const v=String(c==null?'':c).trim();
+  return /^(#[0-9a-fA-F]{3,8}|rgba?\([0-9.,%\s]+\)|var\(--[a-zA-Z0-9-]+\))$/.test(v)?v:'#6E6591';
+};
 function isoOf(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 const today=()=>isoOf(new Date());
 function fmtD(s){if(!s)return'';const d=new Date(s+'T00:00:00');return d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',year:'2-digit'});}
@@ -439,8 +450,10 @@ function e1rm(w,r){ r=Number(r)||1; return Number(w)*(1+r/30); }
 // unrelated to BLANK.version (the data-schema version used for migrations).
 // Bump this + add a line to CHANGELOG whenever a new build is shipped, so
 // it's traceable which fixes/features a given deploy actually contains.
-const APP_VERSION='1.4.0';
+const APP_VERSION='1.5.0';
 const CHANGELOG=[
+  {v:'1.5.0',notes:'Verschlüsselung: Die Daten auf diesem Gerät lassen sich mit einem Passwort verschlüsseln (Einstellungen → Verschlüsselung). Danach sind sie nur noch mit diesem Passwort lesbar – auch für jemanden, der das entsperrte Gerät in die Hand bekommt. Beim Einrichten bekommst du einmalig einen Wiederherstellungscode; bewahre ihn ausserhalb des Geräts auf, denn ohne Passwort oder Code sind die Daten endgültig verloren. Die Cloud-Kopie wird ebenfalls verschlüsselt, sodass auch dort nichts Lesbares liegt. Ausserdem: Konto-Abfrage bei der Ersteinrichtung.'},
+  {v:'1.4.1',notes:'Sicherheits-Update: Namen von eigenen Kategorien, Einträgen und importierten Daten werden jetzt überall sauber maskiert, bevor sie angezeigt werden – relevant vor allem beim CSV-Import, weil daraus automatisch Kategorien entstehen. Zusätzlich werden für die Cloud-Sync-Adresse nur noch vollständige https-Adressen akzeptiert, damit Passwort und Zugangs-Token nicht versehentlich unverschlüsselt oder an eine falsche Adresse gesendet werden können.'},
   {v:'1.4.0',notes:'Cloud-Sync führt widersprüchliche Stände jetzt feingranular zusammen (pro Eintrag), statt immer alles von einer Seite zu verwerfen. Nur Einträge, die auf beiden Geräten unterschiedlich geändert wurden, landen noch in der Konflikt-Abfrage – alles andere (neue Einträge, Änderungen nur auf einer Seite, Löschungen) wird automatisch übernommen.'},
   {v:'1.3.0',notes:'Cloud-Sync mit eigenem Konto (E-Mail + Passwort über Supabase): Daten auf mehreren Geräten synchron halten und automatisches Backup außerhalb des Geräts. Bei widersprüchlichen Ständen fragt die App nach, statt eine Seite zu überschreiben. Einrichtung unter Einstellungen → Cloud-Sync.'},
   {v:'1.2.0',notes:'Trainingseinträge nachträglich bearbeitbar (nicht nur löschbar) · Eigene Budget- und Trainings-Kategorien anlegen/umbenennen/löschen · Volltextsuche über alle Bereiche (Lupe oben) · CSV-Import für Ausgaben mit automatischer Kategorie-Erkennung.'},
@@ -457,23 +470,36 @@ const BLANK={version:2,plan:{workouts:[]},sessions:[],setup:{income:[],fixedCost
  habits:[],habitLog:[],tasks:[],
  meta:{lastExport:'',changes:0,onboarded:false},
  settings:{appName:'',modules:{training:true,budget:true,content:true,habitsTab:true},customCategories:{budget:[],training:[]},sync:{url:'',anonKey:''}}};
+const ENVKEY='alltag-hub-envelope';   // Umschlag, absichtlich im Klartext
+const ENCKEY='alltag-hub-v2-enc';     // verschlüsselter Zustand
+const ENCMIRROR='alltag-hub-v2-enc-mirror';
+// DEK lebt nur im Speicher. Nie schreiben, nie exportieren, nie in S ablegen.
+let DEK=null;
+
 let S=boot();
 
+function normalizeState(d){
+  if(typeof d.version==='number' && d.version>BLANK.version){
+    setTimeout(()=>alert('Hinweis: Diese Daten wurden mit einer neueren Version der App gespeichert (Datenformat '+d.version+'). Manche neueren Felder werden hier eventuell nicht korrekt angezeigt, bis die App aktualisiert ist.'),400);
+  }
+  const n=Object.assign(JSON.parse(JSON.stringify(BLANK)),d);
+  if(!n.meta)n.meta={lastExport:'',changes:0,onboarded:false};
+  if(n.meta.onboarded===undefined)n.meta.onboarded=true;
+  if(!n.settings)n.settings={appName:'',modules:{training:true,budget:true,content:true,habitsTab:true}};
+  if(!n.settings.modules)n.settings.modules={training:true,budget:true,content:true,habitsTab:true};
+  if(!n.settings.customCategories)n.settings.customCategories={budget:[],training:[]};
+  if(!n.settings.sync)n.settings.sync={url:'',anonKey:''};
+  if(n.meta.syncedAt===undefined)n.meta.syncedAt='';
+  if(n.meta.dirty===undefined)n.meta.dirty=false;
+  return n;
+}
 function boot(){
-  const fill=d=>{
-    if(typeof d.version==='number' && d.version>BLANK.version){
-      setTimeout(()=>alert('Hinweis: Diese Daten wurden mit einer neueren Version der App gespeichert (Datenformat '+d.version+'). Manche neueren Felder werden hier eventuell nicht korrekt angezeigt, bis die App aktualisiert ist.'),400);
-    }
-    const n=Object.assign(JSON.parse(JSON.stringify(BLANK)),d);
-    if(!n.meta)n.meta={lastExport:'',changes:0,onboarded:false};
-    if(n.meta.onboarded===undefined)n.meta.onboarded=true;
-    if(!n.settings)n.settings={appName:'',modules:{training:true,budget:true,content:true,habitsTab:true}};
-    if(!n.settings.modules)n.settings.modules={training:true,budget:true,content:true,habitsTab:true};
-    if(!n.settings.customCategories)n.settings.customCategories={budget:[],training:[]};
-    if(!n.settings.sync)n.settings.sync={url:'',anonKey:''};
-    if(n.meta.syncedAt===undefined)n.meta.syncedAt='';
-    if(n.meta.dirty===undefined)n.meta.dirty=false;
-    return n;};
+  const fill=normalizeState;
+  // Ist Verschlüsselung eingerichtet, liegen die Daten nur verschlüsselt vor.
+  // boot() liefert dann bewusst einen leeren Zustand: erst das Entsperren
+  // (unlockAndLoad) füllt ihn. Die Klartext-Quellen werden gar nicht erst
+  // gelesen - es dürfte dort auch nichts mehr liegen (siehe purgePlaintext).
+  if(encryptionActive()) return JSON.parse(JSON.stringify(BLANK));
   try{ const raw=localStorage.getItem(KEY); if(raw) return fill(JSON.parse(raw)); }catch(e){}
   try{ const mir=localStorage.getItem(MIRROR);
     if(mir){ const d=fill(JSON.parse(mir));
@@ -481,6 +507,20 @@ function boot(){
       return d; } }catch(e){}
   try{ const old=localStorage.getItem(OLD); if(old) return migrate(JSON.parse(old)); }catch(e){}
   return JSON.parse(JSON.stringify(BLANK));
+}
+// Entsperren und Zustand laden. Erst wenn beides geklappt hat, wird S ersetzt -
+// ein Fehler unterwegs lässt die App also im gesperrten Zustand stehen, statt
+// sie mit halben Daten weiterlaufen zu lassen.
+function unlockAndLoad(secret,which){
+  return unlockWith(secret,which)
+    .then(()=>loadEncrypted())
+    .then(data=>{
+      if(data===null){ S=JSON.parse(JSON.stringify(BLANK)); return S; }
+      const next=(typeof data.version==='number'&&data.version===BLANK.version)?normalizeState(data):migrate(data);
+      S=next;
+      return S;
+    })
+    .catch(e=>{ lockNow(); throw e; });
 }
 function migrateV1toV2(d){
   const n=Object.assign(JSON.parse(JSON.stringify(BLANK)),d);
@@ -520,6 +560,71 @@ function migrate(d){
   }
   return n;
 }
+/* ===================== SPEICHERPFAD (Klartext ODER verschlüsselt) =========
+ * Die App kann in zwei Betriebsarten laufen:
+ *
+ *   a) Klartext  - wie bisher, KEY/MIRROR enthalten JSON. Gilt, solange kein
+ *                  Umschlag (ENVKEY) existiert.
+ *   b) Verschlüsselt - ENVKEY enthält den Umschlag (nicht geheim: nur Salts
+ *                  und die eingepackten Schlüssel), ENCKEY den Chiffretext.
+ *
+ * Die Betriebsart ergibt sich allein daraus, ob ein Umschlag vorliegt. So
+ * bleibt der bestehende Klartext-Pfad unangetastet, bis die Migration ihn
+ * bewusst umstellt - und ein Fehler in der Verschlüsselung kann niemanden
+ * treffen, der sie nie aktiviert hat.
+ *
+ * Wichtig und bewusst in Kauf genommen: Verschlüsseln ist asynchron. Ein
+ * Schreibvorgang, der beim Schliessen des Tabs noch läuft, kann verloren
+ * gehen - anders als beim synchronen Klartext-Schreiben. Deshalb ist das
+ * Zeitfenster kurz gehalten (siehe save()) und beim Verlassen wird zusätzlich
+ * sofort geschrieben.
+ */
+function storedEnvelope(){
+  try{ const raw=localStorage.getItem(ENVKEY); return raw?JSON.parse(raw):null; }catch(e){ return null; }
+}
+function encryptionActive(){ return !!storedEnvelope(); }
+function isLocked(){ return encryptionActive() && !DEK; }
+function storeEnvelope(env){
+  try{ localStorage.setItem(ENVKEY,JSON.stringify(env)); return true; }
+  catch(e){ return false; }
+}
+// Entsperren: Umschlag + Geheimnis -> DEK im Speicher. Danach liefert
+// loadEncrypted() den Zustand. Schlägt fehl bei falschem Passwort/Code.
+function unlockWith(secret,which){
+  const env=storedEnvelope();
+  if(!env) return Promise.reject(new Error('Für dieses Gerät ist keine Verschlüsselung eingerichtet.'));
+  return openEnvelope(env,secret,which).then(dek=>{ DEK=dek; return dek; });
+}
+function lockNow(){ DEK=null; }
+function loadEncrypted(){
+  if(!DEK) return Promise.reject(new Error('Noch nicht entsperrt.'));
+  let blob=null;
+  try{ const raw=localStorage.getItem(ENCKEY); if(raw) blob=JSON.parse(raw); }catch(e){}
+  if(!blob){
+    try{ const raw=localStorage.getItem(ENCMIRROR); if(raw) blob=JSON.parse(raw); }catch(e){}
+  }
+  if(!blob) return Promise.resolve(null);
+  return decryptState(DEK,blob);
+}
+function saveEncrypted(state){
+  if(!DEK) return Promise.reject(new Error('Noch nicht entsperrt.'));
+  return encryptState(DEK,state).then(blob=>{
+    const j=JSON.stringify(blob);
+    localStorage.setItem(ENCKEY,j);
+    try{ localStorage.setItem(ENCMIRROR,j); }catch(e){}
+    return true;
+  });
+}
+// Beim Umstellen auf Verschlüsselung: Klartext-Reste entfernen. Sonst läge
+// weiterhin eine vollständige, offene Kopie daneben und die ganze Übung wäre
+// wirkungslos.
+function purgePlaintext(){
+  try{ localStorage.removeItem(KEY); }catch(e){}
+  try{ localStorage.removeItem(MIRROR); }catch(e){}
+  try{ localStorage.removeItem(OLD); }catch(e){}
+  try{ localStorage.removeItem(SYNCBASE); }catch(e){}
+}
+
 let U={tab:'home',ts:'plan',bs:'overview',cs:'board',month:mk(new Date()),
  sel:null,prog:null,metric:'top',exp:{},modal:null,draft:null,keep:0};
 let fT=null;
@@ -527,6 +632,11 @@ let saveTimer=null;
 function flushWrite(){
   saveTimer=null;
   try{
+    if(encryptionActive()){
+      if(!DEK) return;                       // gesperrt: nichts schreiben
+      saveEncrypted(S).catch(e=>{ alert('Speichern nicht möglich: '+(e.message||e)); });
+      return;
+    }
     const j=JSON.stringify(S);
     localStorage.setItem(KEY,j);
     try{ localStorage.setItem(MIRROR,j); }catch(e){}
@@ -538,10 +648,17 @@ function save(){
     S.meta.changes=(S.meta.changes||0)+1;
     S.meta.dirty=true;
     if(typeof scheduleAutoSync==='function') scheduleAutoSync();
-    // Coalesce rapid-fire writes (every toggle/keystroke commit) instead of
-    // re-serializing + double-writing the entire app state every single time.
-    // Flushed immediately if the tab is hidden/closed so nothing is lost.
-    clearTimeout(saveTimer); saveTimer=setTimeout(flushWrite,400);
+    // Schreibvorgänge bündeln, statt bei jedem Tastendruck den kompletten
+    // Zustand neu zu serialisieren. Beim Verstecken/Schliessen wird sofort
+    // geschrieben, damit nichts verloren geht.
+    //
+    // Bei aktiver Verschlüsselung ist das Fenster kürzer: Verschlüsseln ist
+    // asynchron, ein beim Schliessen noch laufender Schreibvorgang kann also -
+    // anders als im Klartextbetrieb - abbrechen. Ganz ausschliessen lässt sich
+    // das im Browser nicht; das Fenster wird deshalb klein gehalten. Das
+    // Verschlüsseln selbst dauert für diese Datenmengen deutlich unter einer
+    // Millisekunde, der Verlust wäre also höchstens die allerletzte Änderung.
+    clearTimeout(saveTimer); saveTimer=setTimeout(flushWrite,encryptionActive()?120:400);
     const f=document.getElementById('flash'); f.classList.add('show','pop');
     clearTimeout(fT); fT=setTimeout(()=>f.classList.remove('show','pop'),1000);
   }catch(e){ alert('Speichern nicht möglich: '+e.message); }
@@ -649,6 +766,32 @@ function renderInner(){
   if(!S.settings.modules)S.settings.modules={training:true,budget:true,content:true,habitsTab:true};
   if(!S.settings.customCategories)S.settings.customCategories={budget:[],training:[]};
   if(!S.settings.sync)S.settings.sync={url:'',anonKey:''};
+  if(!S.settings.sync)S.settings.sync={url:'',anonKey:''};
+  // Sperrbildschirm hat Vorrang vor allem anderen: solange nicht entsperrt ist,
+  // steht in S ohnehin nur ein leerer Zustand, und der darf nicht als "deine
+  // Daten" durchgehen - sonst sähe es aus, als wären sie verschwunden.
+  if(isLocked()){
+    document.getElementById('app').innerHTML=lockView();
+    document.getElementById('bn').innerHTML='';
+    document.getElementById('modal').innerHTML='';
+    document.getElementById('timer').innerHTML='';
+    const u=document.getElementById('undo'); if(u)u.innerHTML='';
+    const fb=document.getElementById('fab'); if(fb)fb.innerHTML='';
+    return;
+  }
+  // Kontopflicht: nur bei der Ersteinrichtung. Danach entscheidet allein das
+  // lokale Passwort - eine Anmeldung braucht Netz, und die App soll nicht
+  // unbrauchbar sein, nur weil gerade keins da ist. Ist die Verschlüsselung
+  // eingerichtet, ersetzt der Sperrbildschirm diese Hürde ohnehin.
+  if(!S.meta.onboarded && isEmpty() && !encryptionActive() && !syncLoggedIn() && !U.acctSkip){
+    document.getElementById('app').innerHTML=accountGateView();
+    document.getElementById('bn').innerHTML='';
+    document.getElementById('modal').innerHTML=U.modal?mSheet():'';
+    document.getElementById('timer').innerHTML='';
+    const u=document.getElementById('undo'); if(u)u.innerHTML='';
+    const fb=document.getElementById('fab'); if(fb)fb.innerHTML='';
+    return;
+  }
   if(!S.meta.onboarded && isEmpty() && !U.obSkip){
     document.getElementById('app').innerHTML=onboardView();
     document.getElementById('bn').innerHTML='';
@@ -804,16 +947,16 @@ function heuteChecklist(){
     return h;
   }
   tasks.forEach(x=>{ const p=PRIO[x.priority]||PRIO.soll; const overdue=x.date<today();
-    h+='<div class="row" style="margin-bottom:6px"><button class="checkdot" data-toggletask="'+x.id+'" style="border-color:'+p.color+'"></button>'+
+    h+='<div class="row" style="margin-bottom:6px"><button class="checkdot" data-toggletask="'+esc(x.id)+'" style="border-color:'+p.color+'"></button>'+
      '<div class="grow"><div class="row-n">'+esc(x.title)+'</div>'+
      '<div class="row-m" style="color:'+(overdue?BAD:'var(--dim2)')+'">'+p.label+(overdue?' · überfällig':'')+'</div></div>'+
-     '<button class="iconbtn" data-deltask="'+x.id+'">'+ic('trash','sm')+'</button></div>';});
+     '<button class="iconbtn" data-deltask="'+esc(x.id)+'">'+ic('trash','sm')+'</button></div>';});
   habits.forEach(hb=>{ const done=isHabitDone(hb.id);
-    h+='<div class="row" style="margin-bottom:6px"><button class="checkdot'+(done?' on':'')+'" data-togglehabit="'+hb.id+'" style="border-color:'+VIOLET+(done?';background:'+VIOLET:'')+'"></button>'+
+    h+='<div class="row" style="margin-bottom:6px"><button class="checkdot'+(done?' on':'')+'" data-togglehabit="'+esc(hb.id)+'" style="border-color:'+VIOLET+(done?';background:'+VIOLET:'')+'"></button>'+
      '<div class="grow"><div class="row-n" style="'+(done?'color:var(--dim2);text-decoration:line-through':'')+'">'+esc(hb.name)+'</div>'+
      '<div class="row-m">'+((hb.weekdays&&hb.weekdays.length)?hb.weekdays.join('/'):'Täglich')+'</div></div>'+
-     '<button class="iconbtn" data-edithabit="'+hb.id+'">'+ic('pencil','sm')+'</button>'+
-     '<button class="iconbtn" data-delhabit="'+hb.id+'">'+ic('trash','sm')+'</button></div>';});
+     '<button class="iconbtn" data-edithabit="'+esc(hb.id)+'">'+ic('pencil','sm')+'</button>'+
+     '<button class="iconbtn" data-delhabit="'+esc(hb.id)+'">'+ic('trash','sm')+'</button></div>';});
   h+='</div>';
   return h;
 }
@@ -853,7 +996,7 @@ function vHome(){
   if(dueToday) h+='<div class="panel" style="border-color:'+PINK+'55;background:linear-gradient(135deg,rgba(244,63,142,.14),rgba(27,20,53,.9))">'+
     '<div class="panel-h"><span class="panel-t" style="color:'+PINK+'">'+ic('dumbbell','sm')+' Heute laut Plan</span></div>'+
     '<div class="panel-s">'+esc(dueToday.name)+' · '+dueToday.exercises.length+' Übungen</div>'+
-    '<button class="btn grad" data-quicklog="'+dueToday.id+'">'+ic('play','sm')+' Jetzt loggen</button></div>';
+    '<button class="btn grad" data-quicklog="'+esc(dueToday.id)+'">'+ic('play','sm')+' Jetzt loggen</button></div>';
 
   h+=heuteChecklist();
 
@@ -942,21 +1085,21 @@ function tPlan(){
   if(!S.plan.workouts.length)h+=emptyState('clip',PINK,'Noch kein Trainingsplan','Leg deinen ersten Workout-Tag an – z. B. Push Day, Pull Day oder Legs.','Workout-Tag anlegen','data-aw="1"');
   S.plan.workouts.forEach(w=>{
     const o=!!U.exp[w.id];
-    h+='<div class="wcard"><div class="whead"><button class="wheadbtn" data-tog="'+w.id+'">'+
+    h+='<div class="wcard"><div class="whead"><button class="wheadbtn" data-tog="'+esc(w.id)+'">'+
       '<span style="color:var(--dim2)">'+ic(o?'cd':'cr','sm')+'</span><span class="wname">'+esc(w.name)+'</span>'+
       '<span class="wcount">'+w.exercises.length+' Üb.'+((w.weekdays&&w.weekdays.length)?' · '+w.weekdays.join('/'):'')+'</span></button>'+
-      '<button class="iconbtn" data-ew="'+w.id+'">'+ic('pencil','sm')+'</button>'+
-      '<button class="iconbtn" data-dw="'+w.id+'">'+ic('trash','sm')+'</button></div>';
+      '<button class="iconbtn" data-ew="'+esc(w.id)+'">'+ic('pencil','sm')+'</button>'+
+      '<button class="iconbtn" data-dw="'+esc(w.id)+'">'+ic('trash','sm')+'</button></div>';
     if(o){ h+='<div class="exlist">';
       w.exercises.forEach(ex=>{const c=tcOf(ex.cat);
-        const tgt=c.mode==='sets'?(ex.targetSets||3)+'×'+(ex.targetReps||8):(ex.targetReps||20)+' '+c.unit;
-        h+='<div class="exrow"><span class="dot" style="background:'+c.color+'"></span>'+
+        const tgt=c.mode==='sets'?(ex.targetSets||3)+'×'+(ex.targetReps||8):(ex.targetReps||20)+' '+esc(c.unit);
+        h+='<div class="exrow"><span class="dot" style="background:'+COL(c.color)+'"></span>'+
          '<div class="grow"><div class="row-n">'+esc(ex.name)+'</div>'+
-         '<div class="row-m">'+c.label+' · '+tgt+(ex.goalValue?' · Ziel '+ex.goalValue+' '+c.unit:'')+
+         '<div class="row-m">'+esc(c.label)+' · '+tgt+(ex.goalValue?' · Ziel '+ex.goalValue+' '+esc(c.unit):'')+
          (c.mode==='sets'?' · '+(ex.restSec||90)+'s Pause':'')+'</div></div>'+
-         '<button class="iconbtn" data-ee="'+w.id+'|'+ex.id+'">'+ic('pencil','sm')+'</button>'+
-         '<button class="iconbtn" data-de="'+w.id+'|'+ex.id+'">'+ic('trash','sm')+'</button></div>';});
-      h+='<button class="btn dash" style="margin-top:9px" data-ae="'+w.id+'">'+ic('plus','sm')+' Übung hinzufügen</button></div>';}
+         '<button class="iconbtn" data-ee="'+esc(w.id)+'|'+esc(ex.id)+'">'+ic('pencil','sm')+'</button>'+
+         '<button class="iconbtn" data-de="'+esc(w.id)+'|'+esc(ex.id)+'">'+ic('trash','sm')+'</button></div>';});
+      h+='<button class="btn dash" style="margin-top:9px" data-ae="'+esc(w.id)+'">'+ic('plus','sm')+' Übung hinzufügen</button></div>';}
     h+='</div>';});
   h+='<button class="btn grad" style="margin-top:6px" data-aw="1">'+ic('plus','sm')+' Workout-Tag hinzufügen</button>';
   return h;
@@ -1014,7 +1157,7 @@ function suggestFor(ex){
 
   if(c.mode==='single'){
     const v=Number(last.entry.value)||0;
-    return {text:'Letztes Mal '+v+' '+c.unit+' ('+fmtD(last.date)+')',value:v,tone:'n'};
+    return {text:'Letztes Mal '+v+' '+esc(c.unit)+' ('+fmtD(last.date)+')',value:v,tone:'n'};
   }
 
   const tS=Number(ex.targetSets)||3, tR=Number(ex.targetReps)||8;
@@ -1027,7 +1170,7 @@ function suggestFor(ex){
   // zwei Einheiten in Folge Ziel verfehlt -> Deload
   if(hist.length>=2 && !done && !hitTarget(hist[hist.length-2].entry,ex)){
     const w=bodyweight?0:round25(top*0.9);
-    return {text:'Zweimal das Ziel verfehlt ('+desc+'). Deload: '+(bodyweight?'Wiederholungen reduzieren und sauber aufbauen':'runter auf '+w+' '+c.unit+' und neu aufbauen')+'.',
+    return {text:'Zweimal das Ziel verfehlt ('+desc+'). Deload: '+(bodyweight?'Wiederholungen reduzieren und sauber aufbauen':'runter auf '+w+' '+esc(c.unit)+' und neu aufbauen')+'.',
       weight:bodyweight?'':w,reps:tR,tone:'d',deload:true};
   }
 
@@ -1037,10 +1180,10 @@ function suggestFor(ex){
     const vols=hist.map(h=>(h.entry.sets||[]).reduce((a,s)=>a+(Number(s.reps)||0)*(Number(s.weight)||0),0));
     const noProgress=tops[2]<=tops[0] && vols[2]<=vols[0];
     if(noProgress){
-      if(done) return {text:'Seit drei Einheiten dasselbe Niveau. Statt mehr Gewicht: eine Wiederholung mehr pro Satz ('+(tR+1)+' statt '+tR+') bei '+top+' '+c.unit+'.',
+      if(done) return {text:'Seit drei Einheiten dasselbe Niveau. Statt mehr Gewicht: eine Wiederholung mehr pro Satz ('+(tR+1)+' statt '+tR+') bei '+top+' '+esc(c.unit)+'.',
         weight:bodyweight?'':top,reps:tR+1,tone:'p'};
       const w=bodyweight?0:round25(top*0.9);
-      return {text:'Plateau seit drei Einheiten und Ziel nicht erreicht. Deload auf '+(bodyweight?'weniger Wiederholungen':w+' '+c.unit)+', dann sauber steigern.',
+      return {text:'Plateau seit drei Einheiten und Ziel nicht erreicht. Deload auf '+(bodyweight?'weniger Wiederholungen':w+' '+esc(c.unit))+', dann sauber steigern.',
         weight:bodyweight?'':w,reps:tR,tone:'d',deload:true};
     }
   }
@@ -1054,11 +1197,11 @@ function suggestFor(ex){
     const why = rpe==='leicht' ? 'war leicht – größerer Sprung'
       : rpe==='schwer' ? 'war schwer – kleiner Schritt'
       : 'Ziel erreicht';
-    return {text:why+' ('+desc+'). Heute '+w+' '+c.unit+' versuchen.',weight:w,reps:tR,tone:'u'};
+    return {text:why+' ('+desc+'). Heute '+w+' '+esc(c.unit)+' versuchen.',weight:w,reps:tR,tone:'u'};
   }
 
   // Ziel knapp verfehlt -> Gewicht halten
-  return {text:'Letztes Mal '+desc+' – Ziel '+tS+'×'+tR+' noch offen. Nochmal '+(bodyweight?'sauber wiederholen':top+' '+c.unit)+'.',
+  return {text:'Letztes Mal '+desc+' – Ziel '+tS+'×'+tR+' noch offen. Nochmal '+(bodyweight?'sauber wiederholen':top+' '+esc(c.unit))+'.',
     weight:bodyweight?'':top,reps:tR,tone:'n'};
 }
 function initDraft(){
@@ -1085,11 +1228,11 @@ function syncDraft(){
   w.exercises.forEach(ex=>{
     const d=U.draft.ex[ex.id]; if(!d) return;
     const c=tcOf(ex.cat);
-    const nt=document.querySelector('.dnote[data-e="'+ex.id+'"]'); if(nt) d.note=nt.value;
-    if(c.mode==='single'){ const v=document.querySelector('.dval[data-e="'+ex.id+'"]'); if(v) d.value=v.value; }
+    const nt=document.querySelector('.dnote[data-e="'+esc(ex.id)+'"]'); if(nt) d.note=nt.value;
+    if(c.mode==='single'){ const v=document.querySelector('.dval[data-e="'+esc(ex.id)+'"]'); if(v) d.value=v.value; }
     else{
-      document.querySelectorAll('.drep[data-e="'+ex.id+'"]').forEach((inp,i)=>{ if(d.sets[i]) d.sets[i].reps=inp.value; });
-      document.querySelectorAll('.dwt[data-e="'+ex.id+'"]').forEach((inp,i)=>{ if(d.sets[i]) d.sets[i].weight=inp.value; });
+      document.querySelectorAll('.drep[data-e="'+esc(ex.id)+'"]').forEach((inp,i)=>{ if(d.sets[i]) d.sets[i].reps=inp.value; });
+      document.querySelectorAll('.dwt[data-e="'+esc(ex.id)+'"]').forEach((inp,i)=>{ if(d.sets[i]) d.sets[i].weight=inp.value; });
     }
   });
 }
@@ -1107,7 +1250,7 @@ function tLog(){
      '<label class="lab" style="margin-top:0">Datum</label><input class="f" type="date" id="logD" value="'+U.draft.date+'">';
   } else {
     h+='<label class="lab" style="margin-top:0">Workout</label><select class="f" id="logW">'+
-     S.plan.workouts.map(x=>'<option value="'+x.id+'"'+(x.id===U.draft.workoutId?' selected':'')+'>'+esc(x.name)+'</option>').join('')+'</select>'+
+     S.plan.workouts.map(x=>'<option value="'+esc(x.id)+'"'+(x.id===U.draft.workoutId?' selected':'')+'>'+esc(x.name)+'</option>').join('')+'</select>'+
      '<label class="lab">Datum</label><input class="f" type="date" id="logD" value="'+U.draft.date+'">';
   }
   if(!w.exercises.length)return h+'<p style="color:var(--dim);font-size:13.5px;margin-top:20px">Dieses Workout hat noch keine Übungen.</p>';
@@ -1116,34 +1259,34 @@ function tLog(){
     const c=tcOf(ex.cat); const d=U.draft.ex[ex.id]||{}; const sg=suggestFor(ex);
     const hasHist=!!historyFor(ex.id,1).length;
     h+='<div class="panel"><div style="display:flex;align-items:center;gap:9px;margin-bottom:4px">'+
-      '<span class="dot" style="background:'+c.color+'"></span><span style="font-weight:800;font-size:14px">'+esc(ex.name)+'</span>'+
+      '<span class="dot" style="background:'+COL(c.color)+'"></span><span style="font-weight:800;font-size:14px">'+esc(ex.name)+'</span>'+
       '<span style="margin-left:auto;display:flex;gap:2px">'+
-      (hasHist?'<button class="iconbtn" style="color:var(--dim2)" data-repeatlast="'+ex.id+'">'+ic('repeat','sm')+'</button>':'')+
+      (hasHist?'<button class="iconbtn" style="color:var(--dim2)" data-repeatlast="'+esc(ex.id)+'">'+ic('repeat','sm')+'</button>':'')+
       (c.mode==='sets'?'<button class="iconbtn" style="color:'+VIOLET+'" data-timer="'+(ex.restSec||90)+'|'+esc(ex.name)+'">'+ic('timer','sm')+'</button>':'')+
       '</span></div>';
     if(sg){ const tone=sg.tone==='u'?GOOD:sg.tone==='d'?AMBER:sg.tone==='p'?CYAN:'var(--violet2)';
       h+='<div class="hint" style="color:'+tone+'">'+ic(sg.tone==='u'?'up':sg.tone==='d'?'down':sg.tone==='p'?'repeat':'target','xs')+'<span>'+esc(sg.text)+'</span></div>'; }
     if(c.mode==='single'){
-      h+='<input class="f dval" data-e="'+ex.id+'" type="number" step="any" inputmode="decimal" placeholder="'+c.unit+'" value="'+esc(d.value||'')+'">';
+      h+='<input class="f dval" data-e="'+esc(ex.id)+'" type="number" step="any" inputmode="decimal" placeholder="'+esc(c.unit)+'" value="'+esc(d.value||'')+'">';
     }else{
       h+='<div class="setrow" style="color:var(--dim2);font-size:10.5px;font-weight:700;margin-bottom:4px">'+
         '<span></span><span>WDH</span><span>KG</span><span></span></div>';
       (d.sets||[]).forEach((s,i)=>{
         h+='<div class="setrow"><span class="setn">'+(i+1)+'</span>'+
-         '<input class="f drep" data-e="'+ex.id+'" type="number" inputmode="numeric" placeholder="Wdh" value="'+esc(s.reps||'')+'" style="min-height:44px;padding:10px">'+
-         '<input class="f dwt" data-e="'+ex.id+'" type="number" step="any" inputmode="decimal" placeholder="kg" value="'+esc(s.weight||'')+'" style="min-height:44px;padding:10px">'+
-         '<button class="iconbtn" data-rmset="'+ex.id+'|'+i+'">'+ic('x','sm')+'</button></div>';});
-      h+='<button class="btn dash" data-addset="'+ex.id+'" style="min-height:40px;margin-top:2px">'+ic('plus','xs')+' Satz</button>';
+         '<input class="f drep" data-e="'+esc(ex.id)+'" type="number" inputmode="numeric" placeholder="Wdh" value="'+esc(s.reps||'')+'" style="min-height:44px;padding:10px">'+
+         '<input class="f dwt" data-e="'+esc(ex.id)+'" type="number" step="any" inputmode="decimal" placeholder="kg" value="'+esc(s.weight||'')+'" style="min-height:44px;padding:10px">'+
+         '<button class="iconbtn" data-rmset="'+esc(ex.id)+'|'+i+'">'+ic('x','sm')+'</button></div>';});
+      h+='<button class="btn dash" data-addset="'+esc(ex.id)+'" style="min-height:40px;margin-top:2px">'+ic('plus','xs')+' Satz</button>';
     }
     if(tcOf(ex.cat).mode==='sets'){
       h+='<label class="lab" style="margin:12px 0 6px">Wie hat es sich angefühlt?</label><div class="chips">'+
        [['leicht','Leicht'],['passend','Passend'],['schwer','Schwer']].map(r=>{
         const on=(d.rpe||'')===r[0];
         const col=r[0]==='leicht'?GOOD:r[0]==='schwer'?BAD:VIOLET;
-        return '<button type="button" class="chip" data-rpe="'+ex.id+'|'+r[0]+'" style="flex:1;'+
+        return '<button type="button" class="chip" data-rpe="'+esc(ex.id)+'|'+r[0]+'" style="flex:1;'+
          (on?'background:'+col+'22;border-color:'+col+';color:#fff':'')+'">'+r[1]+'</button>';}).join('')+'</div>';
     }
-    h+='<input class="f dnote" data-e="'+ex.id+'" placeholder="Notiz (optional)" value="'+esc(d.note||'')+'" style="margin-top:9px">'+
+    h+='<input class="f dnote" data-e="'+esc(ex.id)+'" placeholder="Notiz (optional)" value="'+esc(d.note||'')+'" style="margin-top:9px">'+
       '</div>';
   });
   h+='<button class="btn grad" data-savesess="1">'+ic('check','sm')+' Training speichern</button>';
@@ -1192,7 +1335,7 @@ function tProg(){
   const visibleKeys=sq?keys.filter(k=>k.name.toLowerCase().includes(sq)):keys;
   let h='<input class="f" id="progSearch" placeholder="Übung suchen …" value="'+esc(U.searchProg||'')+'" style="margin-bottom:12px">';
   h+='<div class="hchips">'+visibleKeys.map(k=>{const cc=tcOf(k.cat);const on=k.key===U.prog;
-   return '<button class="chip" data-prog="'+esc(k.key)+'"'+(on?' style="background:'+cc.color+'22;border-color:'+cc.color+';color:#fff"':'')+'>'+esc(k.name)+(k.gone?' ·':'')+'</button>';}).join('')+'</div>';
+   return '<button class="chip" data-prog="'+esc(k.key)+'"'+(on?' style="background:'+COL(cc.color)+'22;border-color:'+COL(cc.color)+';color:#fff"':'')+'>'+esc(k.name)+(k.gone?' ·':'')+'</button>';}).join('')+'</div>';
   if(sq&&!visibleKeys.length) h+='<p style="color:var(--dim);font-size:12.5px;margin:-4px 0 12px">Keine Übung passt zu "'+esc(U.searchProg)+'".</p>';
   if(sel.gone) h+='<p style="color:var(--dim2);font-size:11.5px;margin:-6px 0 12px">Diese Übung ist nicht mehr im Plan – der Verlauf bleibt erhalten.</p>';
   if(isSets) h+='<div class="chips" style="margin-bottom:14px">'+
@@ -1210,8 +1353,8 @@ function tProg(){
   if(planEx&&planEx.goalValue&&U.metric==='top'){
     const pct=Math.min(100,Math.max(0,(last.value/Number(planEx.goalValue))*100));
     h+='<div class="panel"><div class="panel-h"><span class="panel-t">'+ic('target','sm')+' Zielfortschritt</span>'+
-      '<span style="font-weight:800;color:'+c.color+'">'+last.value+' / '+planEx.goalValue+' '+c.unit+'</span></div>'+
-      '<div class="track" style="margin-top:10px"><div class="fill" style="width:'+pct+'%;background:linear-gradient(90deg,'+VIOLET+','+c.color+')"></div></div></div>';
+      '<span style="font-weight:800;color:'+COL(c.color)+'">'+last.value+' / '+planEx.goalValue+' '+esc(c.unit)+'</span></div>'+
+      '<div class="track" style="margin-top:10px"><div class="fill" style="width:'+pct+'%;background:linear-gradient(90deg,'+VIOLET+','+COL(c.color)+')"></div></div></div>';
   }
   h+='<div class="chartwrap"><div class="panel-t" style="padding:0 4px 2px">'+esc(sel.name)+'</div>'+
     '<div class="panel-s" style="padding:0 4px">'+(U.metric==='vol'?'Volumen pro Einheit':U.metric==='e1rm'?'Geschätztes 1RM':'Schwerster Satz')+'</div>'+
@@ -1224,8 +1367,8 @@ function tProg(){
      (detail?'<div class="row-m">'+esc(detail)+'</div>':'')+'</div>'+
      '<div style="display:flex;align-items:center;gap:2px"><div class="lnote">'+esc(e.note||'')+'</div>'+
      '<button class="iconbtn" style="min-width:32px;min-height:32px;padding:6px;color:'+VIOLET+'" data-ideafromentry="'+esc(d.date)+'|'+esc(sel.name)+'">'+ic('bulb','xs')+'</button>'+
-     '<button class="iconbtn" style="min-width:32px;min-height:32px;padding:6px;color:var(--dim)" data-editentry="'+e.sessionId+'|'+e.id+'">'+ic('pencil','xs')+'</button>'+
-     '<button class="iconbtn" style="min-width:32px;min-height:32px;padding:6px;color:'+BAD+'" data-dentry="'+e.sessionId+'|'+e.id+'">'+ic('trash','xs')+'</button></div></div>';}).join('')+'</div>';
+     '<button class="iconbtn" style="min-width:32px;min-height:32px;padding:6px;color:var(--dim)" data-editentry="'+esc(e.sessionId)+'|'+esc(e.id)+'">'+ic('pencil','xs')+'</button>'+
+     '<button class="iconbtn" style="min-width:32px;min-height:32px;padding:6px;color:'+BAD+'" data-dentry="'+esc(e.sessionId)+'|'+esc(e.id)+'">'+ic('trash','xs')+'</button></div></div>';}).join('')+'</div>';
   return h;
 }
 function tWeight(){
@@ -1248,7 +1391,7 @@ function tWeight(){
   h+='<div class="chartwrap">'+area(data,LIME,x=>Math.round(x*10)/10)+'</div>';
   h+='<div class="sec">Verlauf</div><div class="loglist">'+s.slice().reverse().map(b=>
    '<div class="lrow"><div class="ldate">'+fmtD(b.date)+'</div><div class="lval">'+b.value+' kg</div>'+
-   '<button class="iconbtn" data-dbw="'+b.id+'">'+ic('trash','sm')+'</button></div>').join('')+'</div>';
+   '<button class="iconbtn" data-dbw="'+esc(b.id)+'">'+ic('trash','sm')+'</button></div>').join('')+'</div>';
   return h;
 }
 
@@ -1294,9 +1437,9 @@ function bOverview(){
     cats.forEach(k=>{const c=bcOf(k);const p=sp>0?(map[k]/sp)*100:0;
       h+='<div class="panel" style="padding:13px;margin-bottom:8px">'+
        '<div style="display:flex;justify-content:space-between;margin-bottom:8px">'+
-       '<span style="display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700"><span class="dot" style="background:'+c.color+'"></span>'+c.label+'</span>'+
+       '<span style="display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700"><span class="dot" style="background:'+COL(c.color)+'"></span>'+esc(c.label)+'</span>'+
        '<span style="font-size:13px;font-weight:800">'+eur2(map[k])+'</span></div>'+
-       '<div class="track" style="height:6px"><div class="fill" style="width:'+p+'%;background:'+c.color+'"></div></div></div>';});
+       '<div class="track" style="height:6px"><div class="fill" style="width:'+p+'%;background:'+COL(c.color)+'"></div></div></div>';});
   }
   return h;
 }
@@ -1308,8 +1451,8 @@ function bIncome(){
     h+='<div class="row"><span class="dot" style="background:'+GOOD+'"></span>'+
      '<div class="grow"><div class="row-n">'+esc(i.name)+'</div><div class="row-m">'+per+'</div></div>'+
      '<div class="amt" style="color:'+GOOD+'">'+eur2(i.amount)+'</div>'+
-     '<button class="iconbtn" data-ei="'+i.id+'">'+ic('pencil','sm')+'</button>'+
-     '<button class="iconbtn" data-di="'+i.id+'">'+ic('trash','sm')+'</button></div>';});
+     '<button class="iconbtn" data-ei="'+esc(i.id)+'">'+ic('pencil','sm')+'</button>'+
+     '<button class="iconbtn" data-di="'+esc(i.id)+'">'+ic('trash','sm')+'</button></div>';});
   h+='<button class="btn dash" style="margin-bottom:22px" data-ai="1">'+ic('plus','sm')+' Feste Einnahme hinzufügen</button>';
 
   h+='<div class="sec">Variable Einnahmen'+mNav().replace('<div class="mnav">','<div class="mnav" style="margin:10px 0 12px">')+'</div>';
@@ -1318,8 +1461,8 @@ function bIncome(){
   list.forEach(e=>{h+='<div class="row"><span class="dot" style="background:'+LIME+'"></span>'+
    '<div class="grow"><div class="row-n">'+esc(e.name)+'</div><div class="row-m">'+fmtD(e.date)+(e.business?' · Betriebseinnahme':'')+'</div></div>'+
    '<div class="amt" style="color:'+LIME+'">'+eur2(e.amount)+'</div>'+
-   '<button class="iconbtn" data-eie="'+e.id+'">'+ic('pencil','sm')+'</button>'+
-   '<button class="iconbtn" data-die="'+e.id+'">'+ic('trash','sm')+'</button></div>';});
+   '<button class="iconbtn" data-eie="'+esc(e.id)+'">'+ic('pencil','sm')+'</button>'+
+   '<button class="iconbtn" data-die="'+esc(e.id)+'">'+ic('trash','sm')+'</button></div>';});
   h+='<button class="btn dash" data-aie="1">'+ic('plus','sm')+' Variable Einnahme (Sponsoring, AdSense …)</button>';
   return h;
 }
@@ -1329,12 +1472,12 @@ function bFixed(){
   S.setup.fixedCosts.forEach(f=>{const c=bcOf(f.category);
     const cur=activeIn(f,U.month);
     const per=(f.validFrom||f.validTo)?((f.validFrom?'ab '+mShort(f.validFrom)+' '+f.validFrom.slice(0,4):'')+(f.validTo?' – '+mShort(f.validTo)+' '+f.validTo.slice(0,4):'')):'dauerhaft';
-    h+='<div class="row" style="opacity:'+(cur?1:.45)+'"><span class="dot" style="background:'+c.color+'"></span>'+
+    h+='<div class="row" style="opacity:'+(cur?1:.45)+'"><span class="dot" style="background:'+COL(c.color)+'"></span>'+
      '<div class="grow"><div class="row-n">'+esc(f.name)+'</div>'+
-     '<div class="row-m">'+c.label+' · '+(f.frequency==='jaehrlich'?'jährlich ('+eur2(monthlyOf(f))+'/Mon.)':'monatlich')+' · '+per+'</div></div>'+
+     '<div class="row-m">'+esc(c.label)+' · '+(f.frequency==='jaehrlich'?'jährlich ('+eur2(monthlyOf(f))+'/Mon.)':'monatlich')+' · '+per+'</div></div>'+
      '<div class="amt">'+eur2(f.amount)+'</div>'+
-     '<button class="iconbtn" data-ef="'+f.id+'">'+ic('pencil','sm')+'</button>'+
-     '<button class="iconbtn" data-df="'+f.id+'">'+ic('trash','sm')+'</button></div>';});
+     '<button class="iconbtn" data-ef="'+esc(f.id)+'">'+ic('pencil','sm')+'</button>'+
+     '<button class="iconbtn" data-df="'+esc(f.id)+'">'+ic('trash','sm')+'</button></div>';});
   h+='<button class="btn dash" data-af="1">'+ic('plus','sm')+' Fixkosten hinzufügen</button>'+
    '<p style="color:var(--dim2);font-size:11.5px;line-height:1.5;margin-top:12px">Mit Gültigkeitszeitraum wirken Fixkosten nur in den Monaten, in denen sie wirklich anfielen – dein Verlauf bleibt korrekt.</p>';
   return h;
@@ -1349,12 +1492,12 @@ function bExp(){
    :emptyState('receipt',CYAN,'Noch nichts in '+mLab(U.month),'Für diesen Monat sind noch keine Ausgaben eingetragen.','Ausgabe hinzufügen','data-ax="1"');
   list.forEach(e=>{const c=bcOf(e.category);
     const vid=e.videoId?S.items.find(i=>i.id===e.videoId):null;
-    h+='<div class="row"><span class="dot" style="background:'+c.color+'"></span>'+
-     '<div class="grow"><div class="row-n">'+esc(e.name)+'</div><div class="row-m">'+fmtD(e.date)+' · '+c.label+
+    h+='<div class="row"><span class="dot" style="background:'+COL(c.color)+'"></span>'+
+     '<div class="grow"><div class="row-n">'+esc(e.name)+'</div><div class="row-m">'+fmtD(e.date)+' · '+esc(c.label)+
      (vid?' · '+esc(vid.title):'')+(e.business?' · Betriebsausgabe':'')+'</div></div>'+
      '<div class="amt">'+eur2(e.amount)+'</div>'+
-     '<button class="iconbtn" data-ex="'+e.id+'">'+ic('pencil','sm')+'</button>'+
-     '<button class="iconbtn" data-dx="'+e.id+'">'+ic('trash','sm')+'</button></div>';});
+     '<button class="iconbtn" data-ex="'+esc(e.id)+'">'+ic('pencil','sm')+'</button>'+
+     '<button class="iconbtn" data-dx="'+esc(e.id)+'">'+ic('trash','sm')+'</button></div>';});
   h+='<button class="btn grad" data-ax="1">'+ic('plus','sm')+' Ausgabe hinzufügen</button>';
   return h;
 }
@@ -1409,7 +1552,7 @@ function bBalance(){
        '<div class="grow"><div class="row-n">'+fmtD(b.date)+'</div>'+
        (b.note?'<div class="row-m">'+esc(b.note)+'</div>':'')+'</div>'+
        '<div class="amt">'+eur2(b.amount)+'</div>'+
-       '<button class="iconbtn" data-dbal="'+b.id+'">'+ic('trash','sm')+'</button></div>';});
+       '<button class="iconbtn" data-dbal="'+esc(b.id)+'">'+ic('trash','sm')+'</button></div>';});
   }
   return h;
 }
@@ -1427,12 +1570,12 @@ function bGoals(){
       rate=md>0?('≈ '+eur(need)+'/Monat nötig'):'Frist erreicht';
     }
     h+='<div class="panel"><div class="panel-h"><span class="panel-t">'+esc(g.name)+'</span>'+
-     '<span style="display:flex"><button class="iconbtn" data-eg="'+g.id+'">'+ic('pencil','sm')+'</button>'+
-     '<button class="iconbtn" data-dg="'+g.id+'">'+ic('trash','sm')+'</button></span></div>'+
+     '<span style="display:flex"><button class="iconbtn" data-eg="'+esc(g.id)+'">'+ic('pencil','sm')+'</button>'+
+     '<button class="iconbtn" data-dg="'+esc(g.id)+'">'+ic('trash','sm')+'</button></span></div>'+
      '<span class="bigval" style="color:'+(done?GOOD:CYAN)+';font-size:21px">'+eur2(g.saved||0)+' <span style="color:var(--dim2);font-size:14px">/ '+eur2(g.target)+'</span></span>'+
      '<div class="track"><div class="fill" style="width:'+pct+'%;background:'+(done?GOOD:'linear-gradient(90deg,'+VIOLET+','+CYAN+')')+'"></div></div>'+
      '<div class="panel-s" style="margin:9px 0 0">'+(g.deadline?('bis '+fmtD(g.deadline)+(rate?' · '+rate:'')):'ohne Frist')+'</div>'+
-     '<button class="btn dash" style="margin-top:11px" data-as="'+g.id+'">'+ic('plus','xs')+' Betrag hinzufügen</button></div>';});
+     '<button class="btn dash" style="margin-top:11px" data-as="'+esc(g.id)+'">'+ic('plus','xs')+' Betrag hinzufügen</button></div>';});
   h+='<button class="btn grad" data-ag="1">'+ic('plus','sm')+' Sparziel hinzufügen</button>';
   return h;
 }
@@ -1531,6 +1674,60 @@ function onboardView(){
   return '<div class="overlay" style="align-items:center"><div class="obcard">'+inner+'</div></div>';
 }
 
+/* ============ KONTO-HÜRDE BEI DER ERSTEINRICHTUNG ============ */
+// Bewusst nur einmal: eine Anmeldung braucht Internet. Wer die App bereits
+// eingerichtet hat, kommt danach auch offline hinein - beim verschlüsselten
+// Betrieb über den Sperrbildschirm, sonst direkt.
+function accountGateView(){
+  const cfg=syncConfigured();
+  return '<div class="overlay" style="align-items:center"><div class="obcard">'+
+   '<div class="obhead">'+ic('layers','lg')+'</div>'+
+   '<div class="obtitle">Konto einrichten</div>'+
+   '<div class="obtext">Mit einem Konto liegen deine Daten auf deinen Geräten synchron und du hast eine Sicherung ausserhalb dieses Geräts. Das ist einmalig – danach startet die App auch ohne Internet.</div>'+
+   (cfg
+     ? '<button class="btn grad" data-syncaccount="1">'+ic('layers','sm')+' Anmelden oder Konto erstellen</button>'
+     : '<div class="panel-s" style="margin-bottom:10px">Dafür muss einmal dein Supabase-Projekt hinterlegt werden – Adresse und öffentlicher Schlüssel.</div>'+
+       '<button class="btn grad" data-syncsetup="1">'+ic('gear','sm')+' Projekt hinterlegen</button>')+
+   '<button type="button" class="btn ghost" style="margin-top:10px;border-color:transparent;color:var(--dim2)" data-acctskip="1">Ohne Konto fortfahren</button>'+
+   '<div class="panel-s" style="margin-top:10px">Ohne Konto bleiben die Daten nur auf diesem Gerät. Geht es verloren, sind sie weg – ausser du legst regelmässig Backups an.</div>'+
+   '</div></div>';
+}
+
+/* ============ SPERRBILDSCHIRM ============ */
+// Wird gezeigt, solange Verschlüsselung eingerichtet, aber nicht entsperrt ist.
+// Bewusst ohne "Später"-Ausweg: ohne Schlüssel gibt es schlicht nichts zu zeigen.
+function lockView(){
+  const mode=U.lockMode||'password';
+  const err=U.lockErr?'<div class="panel-s" style="color:'+BAD+';margin-top:10px">'+esc(U.lockErr)+'</div>':'';
+  const busy=!!U.lockBusy;
+  if(mode==='recovery'){
+    return '<div class="overlay" style="align-items:center"><div class="obcard">'+
+     '<div class="obhead">'+ic('layers','lg')+'</div>'+
+     '<div class="obtitle">Mit Wiederherstellungscode öffnen</div>'+
+     '<div class="obtext">Gib den Code ein, den du beim Einrichten notiert hast. Groß- und Kleinschreibung sowie Bindestriche sind egal. Danach legst du ein neues Passwort fest.</div>'+
+     '<label class="lab" style="margin-top:0">Wiederherstellungscode</label>'+
+     '<input class="f" id="recCode" placeholder="ABCDE-FGHJK-MNPQR-STUVW" autocapitalize="characters" autocomplete="off">'+
+     '<label class="lab">Neues Passwort</label>'+
+     '<input class="f" id="recNewPw" type="password" autocomplete="new-password">'+
+     err+
+     '<button class="btn grad" style="margin-top:20px" data-dorecover="1"'+(busy?' disabled style="opacity:.5"':'')+'>'+
+       (busy?'Einen Moment …':ic('check','sm')+' Zugang wiederherstellen')+'</button>'+
+     '<button type="button" class="btn ghost" style="margin-top:10px;border-color:transparent;color:var(--dim2)" data-lockmode="password">Zurück zur Passworteingabe</button>'+
+     '</div></div>';
+  }
+  return '<div class="overlay" style="align-items:center"><div class="obcard">'+
+   '<div class="obhead">'+ic('layers','lg')+'</div>'+
+   '<div class="obtitle">'+(S.settings&&S.settings.appName?esc(S.settings.appName):'Alltag Hub')+'</div>'+
+   '<div class="obtext">Deine Daten auf diesem Gerät sind verschlüsselt. Gib dein Passwort ein, um sie zu öffnen.</div>'+
+   '<label class="lab" style="margin-top:0">Passwort</label>'+
+   '<input class="f" id="lockPw" type="password" autocomplete="current-password">'+
+   err+
+   '<button class="btn grad" style="margin-top:20px" data-dounlock="1"'+(busy?' disabled style="opacity:.5"':'')+'>'+
+     (busy?'Wird geöffnet …':ic('check','sm')+' Entsperren')+'</button>'+
+   '<button type="button" class="btn ghost" style="margin-top:10px;border-color:transparent;color:var(--dim2)" data-lockmode="recovery">Passwort vergessen?</button>'+
+   '</div></div>';
+}
+
 /* ============ KONTOABGLEICH ============ */
 function monthsBetween(d0,d1){
   const out=[];
@@ -1598,7 +1795,7 @@ function cBoard(){
      '<span class="col-c">'+list.length+'</span></div>';
     if(!list.length)h+='<div style="color:var(--dim3);font-size:12.5px;padding:6px 4px">—</div>';
     list.forEach(it=>{const p=PF[it.platform];const c=costOf(it.id);const r=Number(it.revenue)||0;
-      h+='<div class="kcard" data-eit="'+it.id+'"><div class="kt">'+
+      h+='<div class="kcard" data-eit="'+esc(it.id)+'"><div class="kt">'+
        '<span class="badge" style="color:'+p.color+';border-color:'+p.color+'55">'+p.label+'</span>'+
        (it.recurring?'<span class="kdate">jeden '+it.weekday+'</span>':(it.date?'<span class="kdate">'+fmtD(it.date)+'</span>':''))+'</div>'+
        '<div class="ktitle">'+esc(it.title)+'</div>'+
@@ -1608,9 +1805,9 @@ function cBoard(){
        (it.views?'<span>'+ic('eye','xs')+' '+num(it.views)+'</span>':'')+
        ((r||c)?'<span style="color:'+((r-c)>=0?GOOD:BAD)+'">'+eur(r-c)+'</span>':'')+
        '</div><div class="kfoot">'+
-       (sk!=='fertig'?'<button class="movebtn" style="color:'+GOOD+'" data-cardone="'+it.id+'">'+ic('checkc','sm')+'</button>':'')+
-       (ci>0?'<button class="movebtn" data-mv="'+it.id+'|-1">'+ic('al','sm')+'</button>':'')+
-       (ci<STO.length-1?'<button class="movebtn" data-mv="'+it.id+'|1">'+ic('ar','sm')+'</button>':'')+
+       (sk!=='fertig'?'<button class="movebtn" style="color:'+GOOD+'" data-cardone="'+esc(it.id)+'">'+ic('checkc','sm')+'</button>':'')+
+       (ci>0?'<button class="movebtn" data-mv="'+esc(it.id)+'|-1">'+ic('al','sm')+'</button>':'')+
+       (ci<STO.length-1?'<button class="movebtn" data-mv="'+esc(it.id)+'|1">'+ic('ar','sm')+'</button>':'')+
        '</div></div>';});
     h+='</div>';});
   if((q||pf||ff)&&!anyMatch) h+='<p style="color:var(--dim);font-size:13px;text-align:center;margin-top:8px">Keine Treffer'+(q?' für "'+esc(U.searchContent)+'"':'')+'.</p>';
@@ -1629,14 +1826,14 @@ function cCal(){
   h+='</div>';
   if(rec.length){h+='<div style="margin-top:18px"><div class="sec">'+ic('repeat','xs')+' Wiederkehrend</div>';
     rec.forEach(it=>{const s=ST[it.status],p=PF[it.platform];
-      h+='<div class="row" data-eit="'+it.id+'"><span class="dot" style="background:'+s.color+'"></span>'+
+      h+='<div class="row" data-eit="'+esc(it.id)+'"><span class="dot" style="background:'+s.color+'"></span>'+
        '<div class="grow"><div class="row-n">'+esc(it.title)+'</div><div class="row-m">Jeden '+it.weekday+' · '+p.label+'</div></div></div>';});
     h+='</div>';}
   if(U.sel){const l=by[U.sel]||[];
     h+='<div style="margin-top:18px"><div class="sec">'+fmtD(U.sel)+'</div>';
     if(!l.length)h+='<p style="color:var(--dim);font-size:13px;margin:0 0 10px">Noch nichts geplant.</p>';
     l.forEach(it=>{const s=ST[it.status],p=PF[it.platform];
-      h+='<div class="row" data-eit="'+it.id+'"><span class="dot" style="background:'+s.color+'"></span>'+
+      h+='<div class="row" data-eit="'+esc(it.id)+'"><span class="dot" style="background:'+s.color+'"></span>'+
        '<div class="grow"><div class="row-n">'+esc(it.title)+'</div><div class="row-m">'+p.label+' · '+s.label+'</div></div>'+
        '<span style="color:var(--dim3)">'+ic('pencil','sm')+'</span></div>';});
     h+='<button class="btn dash" data-ai2="'+U.sel+'">'+ic('plus','sm')+' Für diesen Tag planen</button></div>';}
@@ -1713,8 +1910,8 @@ function vHabits(){
     const schedToday=habitScheduled(hb,today());
     const done=habitDoneOn(hb.id,today());
     h+='<div class="panel"><div class="panel-h"><span class="panel-t">'+esc(hb.name)+'</span>'+
-     '<span style="display:flex;gap:2px"><button class="iconbtn" data-edithabit="'+hb.id+'">'+ic('pencil','sm')+'</button>'+
-     '<button class="iconbtn" data-delhabit="'+hb.id+'">'+ic('trash','sm')+'</button></span></div>'+
+     '<span style="display:flex;gap:2px"><button class="iconbtn" data-edithabit="'+esc(hb.id)+'">'+ic('pencil','sm')+'</button>'+
+     '<button class="iconbtn" data-delhabit="'+esc(hb.id)+'">'+ic('trash','sm')+'</button></span></div>'+
      '<div class="panel-s" style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'+
      '<span>'+((hb.weekdays&&hb.weekdays.length)?hb.weekdays.join('/'):'Täglich')+'</span>'+
      (st>0?'<span style="color:#A3E635;font-weight:700;display:flex;align-items:center;gap:3px">'+ic('flame','xs')+' '+st+' Tag'+(st===1?'':'e')+'</span>':'')+
@@ -1725,7 +1922,7 @@ function vHabits(){
       '<div style="aspect-ratio:1;border-radius:7px;background:'+(d.done?'#A3E635':'transparent')+';'+
       'border:1.5px solid '+(d.scheduled?(d.done?'#A3E635':'var(--line2)'):'transparent')+'"></div></div>').join('')+
      '</div>'+
-     (schedToday?'<button class="btn '+(done?'ghost':'grad')+'" style="'+(done?'':'background:linear-gradient(135deg,#A3E635,'+VIOLET+')')+'" data-togglehabit="'+hb.id+'">'+
+     (schedToday?'<button class="btn '+(done?'ghost':'grad')+'" style="'+(done?'':'background:linear-gradient(135deg,#A3E635,'+VIOLET+')')+'" data-togglehabit="'+esc(hb.id)+'">'+
        ic(done?'checkc':'plus','sm')+' '+(done?'Heute erledigt':'Heute abhaken')+'</button>':
        '<div style="color:var(--dim2);font-size:12px">Heute nicht geplant</div>')+
      '</div>';
@@ -1769,10 +1966,10 @@ function vCal(){
     dp.forEach(w=>{h+='<div class="row" style="opacity:.6"><span style="color:'+VIOLET+'">'+ic('clip','sm')+'</span>'+
       '<div class="grow"><div class="row-n">'+esc(w.name)+'</div><div class="row-m">geplant laut Wochenplan</div></div></div>';});
     dc.forEach(it=>{const s=ST[it.status],p=PF[it.platform];
-      h+='<div class="row" data-eit="'+it.id+'"><span style="color:#A78BFA">'+ic('grid','sm')+'</span>'+
+      h+='<div class="row" data-eit="'+esc(it.id)+'"><span style="color:#A78BFA">'+ic('grid','sm')+'</span>'+
        '<div class="grow"><div class="row-n">'+esc(it.title)+'</div><div class="row-m">'+p.label+' · '+s.label+'</div></div></div>';});
     dr.forEach(it=>{const s=ST[it.status],p=PF[it.platform];
-      h+='<div class="row" data-eit="'+it.id+'"><span style="color:#A78BFA">'+ic('repeat','sm')+'</span>'+
+      h+='<div class="row" data-eit="'+esc(it.id)+'"><span style="color:#A78BFA">'+ic('repeat','sm')+'</span>'+
        '<div class="grow"><div class="row-n">'+esc(it.title)+'</div><div class="row-m">Wiederkehrend · '+p.label+'</div></div></div>';});
     h+='</div>';}
   return h;
@@ -2008,6 +2205,193 @@ function importExpenseCsvRows(rows){
   return {imported:imported,created:created};
 }
 
+/* ===================== CRYPTO (lokale Verschlüsselung) =====================
+ * Zweistufig ("envelope encryption"), bewusst nicht direkt Passwort -> Daten:
+ *
+ *   Passwort --PBKDF2--> KEK  --verschlüsselt-->  DEK  --verschlüsselt--> Daten
+ *
+ * Der DEK ist ein zufälliger Schlüssel und verschlüsselt den eigentlichen
+ * Zustand. Das Passwort verschlüsselt nur den DEK. Folge: ein Passwortwechsel
+ * packt ausschliesslich den DEK neu ein - die (potenziell grossen) Daten
+ * müssen nicht angefasst werden, und ältere Backups bleiben lesbar.
+ *
+ * Ohne Passwort sind die Daten nicht wiederherstellbar. Das ist der Sinn der
+ * Sache und ausdrücklich kein Fehler - es gibt keine Hintertür und keinen
+ * Reset. Deshalb erzwingt die App vor dem Aktivieren ein Klartext-Backup.
+ *
+ * Alles hier ist frei von Seiteneffekten und arbeitet nur auf übergebenen
+ * Werten, damit es testbar bleibt (siehe "Crypto" in tests/logic.test.js).
+ */
+const KDF_ITER=310000;           // OWASP-Empfehlung für PBKDF2-SHA256
+const CRYPTO_VERSION=1;          // Format-Version des Umschlags, separat vom Datenschema
+function subtle(){
+  const c=(typeof crypto!=='undefined'&&crypto)||null;
+  if(!c||!c.subtle) throw new Error('Dieser Browser unterstützt die nötige Verschlüsselung nicht (WebCrypto fehlt).');
+  return c.subtle;
+}
+function randBytes(n){ const a=new Uint8Array(n); crypto.getRandomValues(a); return a; }
+function b64(bytes){ let s=''; const a=new Uint8Array(bytes); for(let i=0;i<a.length;i++) s+=String.fromCharCode(a[i]); return btoa(s); }
+function unb64(str){ const s=atob(String(str||'')); const a=new Uint8Array(s.length); for(let i=0;i<s.length;i++) a[i]=s.charCodeAt(i); return a; }
+function utf8(str){ return new TextEncoder().encode(str); }
+function unutf8(bytes){ return new TextDecoder().decode(bytes); }
+
+// Passwort -> KEK. Der Salt gehört zum Umschlag und darf offen daneben liegen;
+// er verhindert nur, dass sich vorberechnete Tabellen wiederverwenden lassen.
+function deriveKEK(password,saltBytes,iter){
+  return subtle().importKey('raw',utf8(String(password)),{name:'PBKDF2'},false,['deriveKey'])
+    .then(base=>subtle().deriveKey(
+      {name:'PBKDF2',salt:saltBytes,iterations:iter||KDF_ITER,hash:'SHA-256'},
+      base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']));
+}
+function aesEncrypt(key,bytes){
+  const iv=randBytes(12);
+  return subtle().encrypt({name:'AES-GCM',iv:iv},key,bytes)
+    .then(ct=>({iv:b64(iv),ct:b64(ct)}));
+}
+function aesDecrypt(key,ivB64,ctB64){
+  return subtle().decrypt({name:'AES-GCM',iv:unb64(ivB64)},key,unb64(ctB64));
+}
+
+// Der DEK kann mehrfach eingepackt werden - einmal pro Geheimnis. Passwort und
+// Wiederherstellungscode öffnen so dieselben Daten, ohne voneinander zu wissen.
+// Genau das entschärft den gefährlichsten Fall: Passwort vergessen == alles weg.
+function wrapDek(dekRaw,secret){
+  const salt=randBytes(16);
+  return deriveKEK(secret,salt).then(kek=>aesEncrypt(kek,dekRaw).then(w=>
+    ({kdf:'PBKDF2-SHA256',iter:KDF_ITER,salt:b64(salt),iv:w.iv,ct:w.ct})));
+}
+function unwrapDek(slot,secret){
+  return deriveKEK(secret,unb64(slot.salt),slot.iter)
+    .then(kek=>aesDecrypt(kek,slot.iv,slot.ct));
+}
+// Menschlich abschreibbarer Code: keine leicht verwechselbaren Zeichen
+// (0/O, 1/I/L), in Blöcken, damit man ihn realistisch auf Papier notieren kann.
+function makeRecoveryCode(){
+  const alpha='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const bytes=randBytes(20);
+  let out='';
+  for(let i=0;i<20;i++){ out+=alpha[bytes[i]%alpha.length]; if(i%5===4&&i<19) out+='-'; }
+  return out;
+}
+function normalizeRecoveryCode(c){ return String(c||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+
+// Neuer Umschlag: ein zufälliger DEK, eingepackt unter Passwort UND unter einem
+// frisch erzeugten Wiederherstellungscode. Der Code wird zurückgegeben, damit
+// die App ihn genau einmal anzeigen kann - gespeichert wird er nirgends.
+function createEnvelope(password){
+  const dekRaw=randBytes(32);
+  const recovery=makeRecoveryCode();
+  return Promise.all([wrapDek(dekRaw,password),wrapDek(dekRaw,normalizeRecoveryCode(recovery))])
+    .then(([pwSlot,recSlot])=>
+      subtle().importKey('raw',dekRaw,{name:'AES-GCM'},false,['encrypt','decrypt']).then(dek=>({
+        envelope:{v:CRYPTO_VERSION,slots:{password:pwSlot,recovery:recSlot}},
+        dek:dek,
+        recoveryCode:recovery
+      })));
+}
+// Öffnet den Umschlag mit einem der hinterlegten Geheimnisse. which='password'
+// oder 'recovery'. Ein falsches Geheimnis scheitert am AES-GCM-Tag - es gibt
+// keinen separaten Vergleich, und es funktioniert offline.
+function openEnvelope(envelope,secret,which){
+  if(!envelope||typeof envelope!=='object') return Promise.reject(new Error('Kein gültiger Schlüssel-Umschlag.'));
+  if(envelope.v>CRYPTO_VERSION) return Promise.reject(new Error('Die Daten wurden mit einer neueren App-Version verschlüsselt. Bitte zuerst die App aktualisieren.'));
+  const kind=which||'password';
+  const slot=envelope.slots&&envelope.slots[kind];
+  if(!slot) return Promise.reject(new Error('Für diesen Zugang ist kein Schlüssel hinterlegt.'));
+  const val=kind==='recovery'?normalizeRecoveryCode(secret):secret;
+  return unwrapDek(slot,val)
+    .then(raw=>subtle().importKey('raw',raw,{name:'AES-GCM'},false,['encrypt','decrypt']))
+    .catch(()=>{ throw new Error(kind==='recovery'?'Wiederherstellungscode stimmt nicht.':'Falsches Passwort.'); });
+}
+// Passwortwechsel: DEK bleibt derselbe, nur sein Passwort-Slot wird neu gepackt.
+// Der Wiederherstellungs-Slot bleibt unberührt und gilt weiter.
+function rewrapEnvelope(envelope,oldPassword,newPassword){
+  const slot=envelope.slots&&envelope.slots.password;
+  if(!slot) return Promise.reject(new Error('Kein Passwort-Schlüssel hinterlegt.'));
+  return unwrapDek(slot,oldPassword)
+    .catch(()=>{ throw new Error('Falsches Passwort.'); })
+    .then(dekRaw=>wrapDek(dekRaw,newPassword).then(fresh=>({
+      v:CRYPTO_VERSION,
+      slots:Object.assign({},envelope.slots,{password:fresh})
+    })));
+}
+// Nach einer Wiederherstellung: neues Passwort setzen, wobei der DEK über den
+// Wiederherstellungscode geöffnet wird. Erzeugt zugleich einen NEUEN Code, denn
+// der alte war ab dem Moment der Benutzung als kompromittiert zu behandeln.
+function resetPasswordWithRecovery(envelope,recoveryCode,newPassword){
+  const slot=envelope.slots&&envelope.slots.recovery;
+  if(!slot) return Promise.reject(new Error('Kein Wiederherstellungsschlüssel hinterlegt.'));
+  return unwrapDek(slot,normalizeRecoveryCode(recoveryCode))
+    .catch(()=>{ throw new Error('Wiederherstellungscode stimmt nicht.'); })
+    .then(dekRaw=>{
+      const fresh=makeRecoveryCode();
+      return Promise.all([wrapDek(dekRaw,newPassword),wrapDek(dekRaw,normalizeRecoveryCode(fresh))])
+        .then(([pwSlot,recSlot])=>({
+          envelope:{v:CRYPTO_VERSION,slots:{password:pwSlot,recovery:recSlot}},
+          recoveryCode:fresh
+        }));
+    });
+}
+function encryptState(dek,state){
+  return aesEncrypt(dek,utf8(JSON.stringify(state))).then(r=>({v:CRYPTO_VERSION,iv:r.iv,ct:r.ct}));
+}
+function decryptState(dek,blob){
+  if(!blob||!blob.ct) return Promise.reject(new Error('Keine verschlüsselten Daten gefunden.'));
+  return aesDecrypt(dek,blob.iv,blob.ct).then(raw=>JSON.parse(unutf8(raw)));
+}
+
+/* ---- Umstellung auf Verschlüsselung ------------------------------------
+ * Der heikelste Vorgang der ganzen App: hier werden bestehende Klartextdaten
+ * unwiderruflich durch eine verschlüsselte Fassung ersetzt. Die Reihenfolge
+ * ist deshalb bewusst gewählt und sollte nicht "aufgeräumt" werden:
+ *
+ *   1. verschlüsseln und schreiben
+ *   2. zurücklesen, entschlüsseln und mit dem Original VERGLEICHEN
+ *   3. erst dann den Umschlag ablegen   <- kippt die Betriebsart
+ *   4. erst dann den Klartext löschen
+ *
+ * Der Umschlag ist der Schalter: sobald er liegt, liest boot() keinen
+ * Klartext mehr. Läge er vor Schritt 2 und das Zurücklesen schlüge fehl,
+ * sähe die App einen leeren Zustand und käme an die noch vorhandenen
+ * Klartextdaten nicht mehr heran. Scheitert dagegen irgendetwas vor
+ * Schritt 3, bleibt schlicht alles beim Alten - unverschlüsselt, aber
+ * vollständig. Das ist in dieser Reihenfolge der harmlosere Ausgang.
+ */
+function migrateToEncrypted(password){
+  if(encryptionActive()) return Promise.reject(new Error('Die Verschlüsselung ist auf diesem Gerät bereits eingerichtet.'));
+  if(!password||String(password).length<6) return Promise.reject(new Error('Das Passwort braucht mindestens 6 Zeichen.'));
+  const original=JSON.parse(JSON.stringify(S));
+  let created=null;
+  return createEnvelope(password).then(e=>{
+    created=e;
+    const prevDek=DEK;
+    DEK=e.dek;
+    return saveEncrypted(original)
+      // Zurücklesen und vergleichen: erst wenn dieselben Daten wieder
+      // herauskommen, ist der Klartext entbehrlich.
+      .then(()=>loadEncrypted())
+      .then(back=>{
+        if(!back||!deepEqual(back,original)){
+          throw new Error('Die verschlüsselte Fassung ließ sich nicht fehlerfrei zurücklesen. Es wurde nichts verändert.');
+        }
+        if(!storeEnvelope(e.envelope)){                    // ab hier gilt: verschlüsselt
+          throw new Error('Der Schlüssel konnte nicht gespeichert werden. Es wurde nichts verändert.');
+        }
+        purgePlaintext();
+        return {recoveryCode:e.recoveryCode};
+      })
+      .catch(err=>{
+        // Aufräumen: alles zurück auf Klartextbetrieb, nichts halb Fertiges
+        // stehen lassen.
+        DEK=prevDek;
+        try{ localStorage.removeItem(ENCKEY); }catch(e2){}
+        try{ localStorage.removeItem(ENCMIRROR); }catch(e2){}
+        try{ localStorage.removeItem(ENVKEY); }catch(e2){}
+        throw err;
+      });
+  });
+}
+
 /* ===================== CLOUD SYNC (Supabase) =====================
  * Talks directly to Supabase's REST/Auth endpoints from the browser - no
  * build step, no serverless functions. The anon key is public by design;
@@ -2029,7 +2413,16 @@ function syncCfg(){
   const c=(S.settings&&S.settings.sync)||{};
   return {url:String(c.url||'').trim().replace(/\/+$/,''),key:String(c.anonKey||'').trim()};
 }
-function syncConfigured(){ const c=syncCfg(); return !!(c.url&&c.key); }
+// Only absolute https URLs are accepted as a sync endpoint. Checked both on
+// input AND here, because settings can also arrive via an imported backup or
+// a cloud payload, which never passed through the setup form.
+function validSyncUrl(u){
+  const v=String(u||'').trim();
+  if(!/^https:\/\//i.test(v)) return false;
+  try{ const p=new URL(v); return p.protocol==='https:' && !!p.hostname && p.hostname.indexOf('.')>0; }
+  catch(e){ return false; }
+}
+function syncConfigured(){ const c=syncCfg(); return !!(c.url&&c.key&&validSyncUrl(c.url)); }
 function syncLoggedIn(){ return !!(SESS&&SESS.access_token&&SESS.user_id); }
 function sbHeaders(auth){
   const c=syncCfg();
@@ -2085,18 +2478,59 @@ function sbAuthed(fn){
     throw e;
   });
 }
+/* Cloud-Format
+ * Klartext-Betrieb:     data = <der Zustand selbst>          (wie bisher)
+ * Verschlüsselt:        data = {enc:{v,iv,ct}, envelope:{…}}
+ *
+ * Der Umschlag wandert bewusst mit: nur so kann ein zweites Gerät die Daten
+ * mit demselben Passwort öffnen. Er enthält keine Geheimnisse, sondern nur
+ * Salts und die eingepackten Schlüssel - Supabase sieht in beiden Feldern
+ * nichts Lesbares.
+ */
+function isEncryptedPayload(d){ return !!(d&&typeof d==='object'&&d.enc&&d.enc.ct&&d.envelope); }
+function buildCloudPayload(){
+  if(!encryptionActive()) return Promise.resolve(S);
+  if(!DEK) return Promise.reject(new Error('Zum Synchronisieren muss die App entsperrt sein.'));
+  const env=storedEnvelope();
+  return encryptState(DEK,S).then(blob=>({enc:blob,envelope:env}));
+}
+// Gegenstück: macht aus dem, was in der Cloud liegt, einen lesbaren Zustand.
+// Kann das Gerät die Daten nicht öffnen, wird das als eigener Fehler gemeldet
+// statt stillschweigend etwas anderes zu tun.
+function readCloudData(d){
+  if(!isEncryptedPayload(d)) return Promise.resolve(d);
+  if(!DEK){
+    const err=new Error('Die Daten in der Cloud sind verschlüsselt. Richte die Verschlüsselung auf diesem Gerät ein bzw. entsperre die App, um sie zu öffnen.');
+    err.needsUnlock=true; err.envelope=d.envelope;
+    return Promise.reject(err);
+  }
+  return decryptState(DEK,d.enc).catch(()=>{
+    const err=new Error('Die Cloud-Daten ließen sich mit dem Schlüssel dieses Geräts nicht öffnen. Vermutlich wurde das Passwort auf einem anderen Gerät geändert.');
+    err.needsUnlock=true; err.envelope=d.envelope;
+    throw err;
+  });
+}
 function cloudPull(){
   return sbAuthed(()=>fetch(syncCfg().url+'/rest/v1/app_state?select=data,updated_at&user_id=eq.'+
     encodeURIComponent(SESS.user_id),{headers:sbHeaders(true)})
     .then(sbRead).then(rows=>(rows&&rows.length)?rows[0]:null));
 }
-function cloudPush(){
-  return sbAuthed(()=>{
-    const h=sbHeaders(true);
-    h['Prefer']='resolution=merge-duplicates,return=representation';
-    const payload=[{user_id:SESS.user_id,data:S,updated_at:new Date().toISOString()}];
-    return fetch(syncCfg().url+'/rest/v1/app_state',{method:'POST',headers:h,body:JSON.stringify(payload)})
-      .then(sbRead).then(rows=>(rows&&rows.length)?rows[0]:null);
+function cloudPush(existingRow){
+  return buildCloudPayload().then(data=>{
+    // Schutz vor Rückschritt: liegt in der Cloud bereits eine verschlüsselte
+    // Fassung, darf ein noch unverschlüsseltes Gerät sie nicht mit Klartext
+    // überschreiben. Sonst würde ein Gerät, das gerade umgestellt wurde, vom
+    // zweiten still wieder ausgehebelt - und die Daten lägen wieder offen.
+    if(existingRow&&isEncryptedPayload(existingRow.data)&&!isEncryptedPayload(data)){
+      throw new Error('In der Cloud liegen bereits verschlüsselte Daten. Richte die Verschlüsselung auch auf diesem Gerät ein, bevor du synchronisierst.');
+    }
+    return sbAuthed(()=>{
+      const h=sbHeaders(true);
+      h['Prefer']='resolution=merge-duplicates,return=representation';
+      const payload=[{user_id:SESS.user_id,data:data,updated_at:new Date().toISOString()}];
+      return fetch(syncCfg().url+'/rest/v1/app_state',{method:'POST',headers:h,body:JSON.stringify(payload)})
+        .then(sbRead).then(rows=>(rows&&rows.length)?rows[0]:null);
+    });
   });
 }
 // Decides what a sync should do, without doing any I/O - kept pure so it can
@@ -2253,8 +2687,8 @@ function mergeSummaryMsg(counts){
   if(counts.conflicted) parts.push(counts.conflicted+' Konflikt'+(counts.conflicted===1?'':'e')+' aufgelöst');
   return parts.length?('Zusammengeführt: '+parts.join(' · ')+'.'):'Zusammengeführt – keine inhaltlichen Unterschiede.';
 }
-function applyRemote(row){
-  const d=row&&row.data;
+// Übernimmt einen bereits entschlüsselten Zustand.
+function applyRemoteState(d,updatedAt){
   if(!d||typeof d!=='object') throw new Error('Die Cloud enthält keine gültigen Daten.');
   if(typeof d.version==='number'&&d.version>BLANK.version)
     throw new Error('Die Cloud-Daten stammen aus einer neueren App-Version. Bitte zuerst die App aktualisieren.');
@@ -2263,8 +2697,13 @@ function applyRemote(row){
   const prev=S;
   S=next;
   if(!render()){ S=prev; render(); throw new Error('Die Cloud-Daten konnten nicht geladen werden.'); }
-  markSynced(row.updated_at);
+  markSynced(updatedAt);
   render();
+}
+// Entschlüsselt bei Bedarf und übernimmt dann. Gibt eine Promise zurück, weil
+// das Entschlüsseln asynchron ist.
+function applyRemote(row){
+  return readCloudData(row&&row.data).then(d=>applyRemoteState(d,row.updated_at));
 }
 let syncBusy=false;
 function setSyncMsg(msg,isError){
@@ -2282,6 +2721,23 @@ function doSync(force){
     let action=force==='local'?'push':force==='cloud'?'pull':syncDecision(row,(S.meta&&S.meta.syncedAt)||'',!!(S.meta&&S.meta.dirty));
     if(action==='pull'&&!row) action='push';
     if(action==='uptodate'){ setSyncMsg('Alles aktuell.'); return {action:'uptodate'}; }
+    // Liegt in der Cloud eine verschlüsselte Fassung, die dieses Gerät nicht
+    // öffnen kann, wird HIER abgebrochen - vor jeder Entscheidung über Push,
+    // Pull oder Merge. Andernfalls würde gleich als Erstes der eigene Klartext
+    // über die verschlüsselten Daten geschrieben.
+    if(row&&isEncryptedPayload(row.data)&&!DEK){
+      const env=row.data.envelope;
+      if(env&&!encryptionActive()){
+        // Zweites Gerät, erstmals verbunden: Umschlag übernehmen, danach kann
+        // dasselbe Passwort die Daten öffnen.
+        storeEnvelope(env);
+        setSyncMsg('Die Daten in der Cloud sind verschlüsselt. Bitte die App mit deinem Passwort entsperren.',true);
+        render();
+        return {action:'needsunlock'};
+      }
+      setSyncMsg('Die Daten in der Cloud sind verschlüsselt. Bitte die App entsperren und erneut synchronisieren.',true);
+      return {action:'needsunlock'};
+    }
     if(action==='conflict'){
       let baseSnap=null;
       try{ const raw=localStorage.getItem(SYNCBASE); if(raw) baseSnap=JSON.parse(raw); }catch(e){}
@@ -2292,18 +2748,20 @@ function doSync(force){
       // sides' entries are unioned and only same-id records that actually
       // differ still count as a conflict. Strictly safer than the old
       // all-or-nothing choice, which silently discarded one whole side.
-      const mp=mergeState(baseSnap||{},S,row.data);
-      if(mp.conflicts.length===0){
-        const prevS=S;
-        S=mp.merged;
-        if(!render()){ S=prevS; render(); U.syncConflict=row; setSyncMsg('',false); U.modal={type:'syncconflict'}; render(); return {action:'conflict'}; }
-        return cloudPush().then(saved=>{ markSynced(saved&&saved.updated_at); setSyncMsg(mergeSummaryMsg(mp.counts)); render(); return {action:'merged',counts:mp.counts}; });
-      }
-      U.syncConflict=row; U.syncMergePreview=mp; setSyncMsg('',false); U.modal={type:'syncconflict'}; render();
-      return {action:'conflict',conflicts:mp.conflicts.length};
+      return readCloudData(row.data).then(remoteState=>{
+        const mp=mergeState(baseSnap||{},S,remoteState);
+        if(mp.conflicts.length===0){
+          const prevS=S;
+          S=mp.merged;
+          if(!render()){ S=prevS; render(); U.syncConflict=row; setSyncMsg('',false); U.modal={type:'syncconflict'}; render(); return {action:'conflict'}; }
+          return cloudPush(row).then(saved=>{ markSynced(saved&&saved.updated_at); setSyncMsg(mergeSummaryMsg(mp.counts)); render(); return {action:'merged',counts:mp.counts}; });
+        }
+        U.syncConflict=row; U.syncMergePreview=mp; setSyncMsg('',false); U.modal={type:'syncconflict'}; render();
+        return {action:'conflict',conflicts:mp.conflicts.length};
+      });
     }
-    if(action==='pull'){ applyRemote(row); setSyncMsg('Von der Cloud geladen.'); return {action:'pulled'}; }
-    return cloudPush().then(saved=>{ markSynced(saved&&saved.updated_at); setSyncMsg('In die Cloud gesichert.'); render(); return {action:'pushed'}; });
+    if(action==='pull'){ return applyRemote(row).then(()=>{ setSyncMsg('Von der Cloud geladen.'); return {action:'pulled'}; }); }
+    return cloudPush(row).then(saved=>{ markSynced(saved&&saved.updated_at); setSyncMsg('In die Cloud gesichert.'); render(); return {action:'pushed'}; });
   }).catch(e=>{
     setSyncMsg(e.message||'Synchronisieren fehlgeschlagen.',true);
     return {action:'error',error:e};
@@ -2377,9 +2835,9 @@ function sheet(title,inner,delKind){
    '</form></div>';
 }
 function picks(field,opts,cur,colorOf){
-  return '<div class="chips">'+opts.map(o=>{const c=colorOf(o.k);const on=cur===o.k;
-   return '<button type="button" class="chip" data-pick="'+field+'|'+o.k+'"'+
-    (on?' style="background:'+c+'22;border-color:'+c+';color:#fff"':'')+'>'+o.l+'</button>';}).join('')+'</div>';
+  return '<div class="chips">'+opts.map(o=>{const c=COL(colorOf(o.k));const on=cur===o.k;
+   return '<button type="button" class="chip" data-pick="'+esc(field)+'|'+esc(o.k)+'"'+
+    (on?' style="background:'+c+'22;border-color:'+c+';color:#fff"':'')+'>'+esc(o.l)+'</button>';}).join('')+'</div>';
 }
 function mSheet(){
   const m=U.modal;
@@ -2407,6 +2865,46 @@ function mSheet(){
      (mode==='signup'?'<div class="panel-s" style="margin-top:8px">Mindestens 6 Zeichen. Je nach Projekteinstellung musst du die Adresse per E-Mail bestätigen, bevor die Anmeldung klappt.</div>':'')+
      (U.syncMsg?'<div class="panel-s" style="color:'+(U.syncErr?BAD:GOOD)+'">'+esc(U.syncMsg)+'</div>':'')+
      '<button type="submit" class="btn grad" style="margin-top:22px">'+(mode==='login'?'Anmelden':'Konto erstellen')+'</button>');
+  }
+  if(m.type==='encsetup'){
+    // Das Backup ist hier kein Hinweis, sondern Bedingung: nach der Umstellung
+    // gibt es ohne Passwort oder Code keinen Weg mehr an die Daten. Freigegeben
+    // wird erst, wenn in DIESEM Ablauf wirklich exportiert wurde.
+    const done=!!U.encBackupDone;
+    const busy=!!U.encBusy;
+    return sheet('Daten auf diesem Gerät verschlüsseln',
+     '<div class="panel-s" style="margin:0 0 12px">Danach sind deine Daten auf diesem Gerät nur noch mit deinem Passwort lesbar – auch für jemanden, der das entsperrte Gerät in die Hand bekommt.</div>'+
+     '<div class="panel-s" style="margin-bottom:12px;border-color:'+BAD+'55">Es gibt keine Hintertür. Vergisst du Passwort <em>und</em> Wiederherstellungscode, sind die Daten endgültig verloren – auch ich kann sie dann nicht zurückholen. Deshalb zuerst ein Backup.</div>'+
+     '<button type="button" class="btn '+(done?'ghost':'grad')+'" data-expjson="1">'+ic('dl','sm')+' '+(done?'Backup erneut sichern':'Backup als Datei sichern')+'</button>'+
+     (done?'<div class="panel-s" style="margin-top:8px;color:'+GOOD+'">Backup gesichert. Du kannst fortfahren.</div>':'')+
+     '<div style="height:14px"></div>'+
+     '<label class="lab" style="margin-top:0">Passwort</label>'+
+     '<input class="f" id="encPw1" type="password" autocomplete="new-password"'+(done?'':' disabled')+'>'+
+     '<label class="lab">Passwort wiederholen</label>'+
+     '<input class="f" id="encPw2" type="password" autocomplete="new-password"'+(done?'':' disabled')+'>'+
+     '<div class="panel-s" style="margin-top:8px">Mindestens 6 Zeichen. Nimm dasselbe Passwort wie für dein Konto – sonst musst du dir zwei merken.</div>'+
+     (U.encErr?'<div class="panel-s" style="color:'+BAD+'">'+esc(U.encErr)+'</div>':'')+
+     '<button type="button" class="btn grad" style="margin-top:18px" data-runencsetup="1"'+((done&&!busy)?'':' disabled style="opacity:.45"')+'>'+
+       (busy?'Wird eingerichtet …':ic('check','sm')+' Jetzt verschlüsseln')+'</button>');
+  }
+  if(m.type==='recoverycode'){
+    // Der Code wird genau einmal gezeigt und nirgends gespeichert - sonst wäre
+    // er wertlos. Deshalb kein einfaches Wegtippen: es braucht eine bewusste
+    // Bestätigung, dass er notiert wurde.
+    const confirmed=!!m.confirmed;
+    return sheet('Wiederherstellungscode',
+     '<div class="panel-s" style="margin:0 0 12px">'+
+      (m.afterReset?'Dein Passwort wurde geändert. Der alte Code gilt ab sofort nicht mehr – hier ist dein neuer.':
+       'Schreib diesen Code auf und bewahre ihn außerhalb dieses Geräts auf, zum Beispiel auf Papier.')+
+      ' Er ist der einzige Weg zurück, falls du dein Passwort vergisst. Er wird nirgends gespeichert und lässt sich später nicht noch einmal anzeigen.</div>'+
+     '<div class="panel" style="padding:16px;text-align:center;font-family:monospace;font-size:17px;font-weight:800;letter-spacing:.08em;word-break:break-all">'+esc(m.code)+'</div>'+
+     '<div style="height:10px"></div>'+
+     '<button type="button" class="btn ghost" data-copyreccode="'+esc(m.code)+'">'+ic('layers','sm')+' Code kopieren</button>'+
+     '<div style="height:14px"></div>'+
+     '<label class="row" style="cursor:pointer"><input type="checkbox" id="recAck"'+(confirmed?' checked':'')+' data-recack="1" style="width:18px;height:18px;margin-right:10px">'+
+      '<span class="grow row-n" style="font-weight:600">Ich habe den Code notiert</span></label>'+
+     '<div style="height:10px"></div>'+
+     '<button type="button" class="btn grad" data-reccodedone="1"'+(confirmed?'':' disabled style="opacity:.45"')+'>Fertig</button>');
   }
   if(m.type==='syncconflict'){
     const row=U.syncConflict;
@@ -2556,6 +3054,12 @@ function mSheet(){
            '<div style="height:8px"></div>'+
            '<button type="button" class="btn ghost" data-synclogout="1">Abmelden</button>'))+
      '</div>'+
+     '<div class="panel"><div class="panel-t">Verschlüsselung auf diesem Gerät</div>'+
+     (encryptionActive()
+       ? '<div class="panel-s" style="color:'+GOOD+'">Aktiv. Deine Daten liegen auf diesem Gerät verschlüsselt und sind nur mit deinem Passwort lesbar.</div>'
+       : '<div class="panel-s">Zurzeit liegen deine Daten unverschlüsselt auf dem Gerät – wer es entsperrt in die Hand bekommt, kann sie lesen. Mit einem Passwort lässt sich das ändern.</div>'+
+         '<button type="button" class="btn ghost" data-encsetup="1">'+ic('gear','sm')+' Verschlüsselung einrichten</button>')+
+     '</div>'+
      '<div class="panel"><div class="panel-t">CSV-Import (Ausgaben)</div>'+
      '<div class="panel-s">Ausgaben aus einer Excel-/Bank-CSV importieren. Unbekannte Kategorien werden automatisch als eigene Kategorie angelegt.</div>'+
      '<button type="button" class="btn ghost" data-opencsvimport="1">'+ic('ul','sm')+' CSV auswählen</button></div>'+
@@ -2570,18 +3074,18 @@ function mSheet(){
      '<div class="panel-s">Zusätzlich zu den festen Kategorien. Löschen entfernt nur die Kategorie selbst – bereits damit erfasste Einträge bleiben erhalten und zeigen weiter ihren alten Namen.</div>'+
      '<div style="font-size:11px;font-weight:700;color:var(--dim2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Budget</div>'+
      ((S.settings.customCategories.budget||[]).map(c=>
-       '<div class="row" style="margin-bottom:6px"><span class="dot" style="background:'+c.color+'"></span>'+
+       '<div class="row" style="margin-bottom:6px"><span class="dot" style="background:'+COL(c.color)+'"></span>'+
        '<div class="grow row-n">'+esc(c.label)+'</div>'+
-       '<button class="iconbtn" data-editcustomcat="budget|'+c.key+'">'+ic('pencil','sm')+'</button>'+
-       '<button class="iconbtn" data-delcustomcat="budget|'+c.key+'">'+ic('trash','sm')+'</button></div>').join('')||
+       '<button class="iconbtn" data-editcustomcat="budget|'+esc(c.key)+'">'+ic('pencil','sm')+'</button>'+
+       '<button class="iconbtn" data-delcustomcat="budget|'+esc(c.key)+'">'+ic('trash','sm')+'</button></div>').join('')||
       '<div class="panel-s" style="margin-bottom:10px">Noch keine eigenen Budget-Kategorien.</div>')+
      '<button type="button" class="btn dash" style="margin-bottom:14px" data-addcustomcat="budget">'+ic('plus','sm')+' Budget-Kategorie hinzufügen</button>'+
      '<div style="font-size:11px;font-weight:700;color:var(--dim2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Training</div>'+
      ((S.settings.customCategories.training||[]).map(c=>
-       '<div class="row" style="margin-bottom:6px"><span class="dot" style="background:'+c.color+'"></span>'+
+       '<div class="row" style="margin-bottom:6px"><span class="dot" style="background:'+COL(c.color)+'"></span>'+
        '<div class="grow"><div class="row-n">'+esc(c.label)+'</div><div class="row-m">'+(c.mode==='single'?'Einzelwert':'Sätze')+' · '+esc(c.unit)+'</div></div>'+
-       '<button class="iconbtn" data-editcustomcat="training|'+c.key+'">'+ic('pencil','sm')+'</button>'+
-       '<button class="iconbtn" data-delcustomcat="training|'+c.key+'">'+ic('trash','sm')+'</button></div>').join('')||
+       '<button class="iconbtn" data-editcustomcat="training|'+esc(c.key)+'">'+ic('pencil','sm')+'</button>'+
+       '<button class="iconbtn" data-delcustomcat="training|'+esc(c.key)+'">'+ic('trash','sm')+'</button></div>').join('')||
       '<div class="panel-s" style="margin-bottom:10px">Noch keine eigenen Trainings-Kategorien.</div>')+
      '<button type="button" class="btn dash" data-addcustomcat="training">'+ic('plus','sm')+' Trainings-Kategorie hinzufügen</button></div>'+
      '<div class="panel"><div class="panel-t">Steuer / Buchhaltung</div>'+
@@ -2638,7 +3142,7 @@ function mSheet(){
         '<input class="f" name="restSec" type="number" inputmode="numeric" value="'+(ex&&ex.restSec?ex.restSec:90)+'">'+
         '<label class="lab">Zielgewicht (kg, optional)</label>'+
         '<input class="f" name="goalValue" type="number" step="any" inputmode="decimal" value="'+(ex&&ex.goalValue?ex.goalValue:'')+'" placeholder="z. B. 100">'
-      : '<label class="lab">Zielwert ('+c.unit+', optional)</label>'+
+      : '<label class="lab">Zielwert ('+esc(c.unit)+', optional)</label>'+
         '<input class="f" name="goalValue" type="number" step="any" inputmode="decimal" value="'+(ex&&ex.goalValue?ex.goalValue:'')+'" placeholder="z. B. 30">')+
      '<button type="submit" class="btn grad" style="margin-top:22px">Speichern</button>',
      ex?'exercise':null);
@@ -2691,7 +3195,7 @@ function mSheet(){
      '<label class="lab">Datum</label><input class="f" name="date" type="date" value="'+(it?it.date:(U.month===mk(new Date())?today():U.month+'-01'))+'" required>'+
      '<label class="lab">Video zuordnen (optional, für ROI)</label>'+
      '<select class="f" name="videoId"><option value="">— keins —</option>'+
-     S.items.map(i=>'<option value="'+i.id+'"'+(vid===i.id?' selected':'')+'>'+esc(i.title)+'</option>').join('')+'</select>'+
+     S.items.map(i=>'<option value="'+esc(i.id)+'"'+(vid===i.id?' selected':'')+'>'+esc(i.title)+'</option>').join('')+'</select>'+
      '<label class="lab">Art</label><div class="chk"><input type="checkbox" id="bizchk" '+(biz?'checked':'')+' data-bizchk="1"><span>Betriebsausgabe (für Steuer-Export)</span></div>'+
      '<button type="submit" class="btn grad" style="margin-top:22px">Speichern</button>');
   }
@@ -2749,7 +3253,7 @@ function mSheet(){
     const sets=m.sets||[];
     let inner='<div class="panel-s" style="margin:0 0 12px">'+fmtD(sess.date)+' · '+esc(en.name)+'</div>';
     if(c.mode==='single'){
-      inner+='<label class="lab" style="margin-top:0">Wert ('+c.unit+')</label>'+
+      inner+='<label class="lab" style="margin-top:0">Wert ('+esc(c.unit)+')</label>'+
         '<input class="f" name="value" type="number" step="any" inputmode="decimal" value="'+esc(en.value!=null?en.value:'')+'">';
     } else {
       inner+='<div class="setrow" style="color:var(--dim2);font-size:10.5px;font-weight:700;margin-bottom:4px">'+
@@ -2794,7 +3298,7 @@ function mSheet(){
 /* ===================== EVENTS ===================== */
 document.addEventListener('click',function(e){
   if(e.target.id==='ov'){U.modal=null;render();return;}
-  const t=e.target.closest('[data-tab],[data-ts],[data-bs],[data-cs],[data-tog],[data-aw],[data-ew],[data-dw],[data-ae],[data-ee],[data-de],[data-savesess],[data-prog],[data-metric],[data-abw],[data-dbw],[data-mo],[data-ai],[data-ei],[data-di],[data-aie],[data-eie],[data-die],[data-af],[data-ef],[data-df],[data-ax],[data-ex],[data-dx],[data-ag],[data-eg],[data-dg],[data-as],[data-ai2],[data-eit],[data-mv],[data-day],[data-mclose],[data-pick],[data-dtog],[data-mdel],[data-settings],[data-expjson],[data-taxexport],[data-reset],[data-resetconfirm],[data-addset],[data-rmset],[data-timer],[data-stoptimer],[data-bizchk],[data-undo],[data-rpe],[data-reconcile],[data-balsave],[data-balbook],[data-dbal],[data-tpl],[data-fab],[data-fabact],[data-obfocus],[data-obnext],[data-obdemo],[data-obfinish],[data-copybackup],[data-saveappname],[data-restoremirror],[data-hardreload],[data-swreload],[data-addcustomcat],[data-editcustomcat],[data-delcustomcat],[data-globalsearch],[data-searchresult],[data-opencsvimport],[data-resetcsvimport],[data-runcsvimport],[data-syncsetup],[data-syncaccount],[data-syncnow],[data-synclogout],[data-syncresolve],[data-syncmerge],[data-repeatlast],[data-quicklog],[data-ideafromworkout],[data-gotogoals],[data-cardone],[data-platfilter],[data-formatfilter],[data-psact],[data-reloaddemo],[data-ideafromentry],[data-dentry],[data-editentry],[data-eseaddset],[data-esermset],[data-clearfilters],[data-unquick],[data-addhabit],[data-edithabit],[data-delhabit],[data-togglehabit],[data-addtask],[data-edittask],[data-deltask],[data-toggletask],[data-togglemore],[data-modtoggle]');
+  const t=e.target.closest('[data-tab],[data-ts],[data-bs],[data-cs],[data-tog],[data-aw],[data-ew],[data-dw],[data-ae],[data-ee],[data-de],[data-savesess],[data-prog],[data-metric],[data-abw],[data-dbw],[data-mo],[data-ai],[data-ei],[data-di],[data-aie],[data-eie],[data-die],[data-af],[data-ef],[data-df],[data-ax],[data-ex],[data-dx],[data-ag],[data-eg],[data-dg],[data-as],[data-ai2],[data-eit],[data-mv],[data-day],[data-mclose],[data-pick],[data-dtog],[data-mdel],[data-settings],[data-expjson],[data-taxexport],[data-reset],[data-resetconfirm],[data-addset],[data-rmset],[data-timer],[data-stoptimer],[data-bizchk],[data-undo],[data-rpe],[data-reconcile],[data-balsave],[data-balbook],[data-dbal],[data-tpl],[data-fab],[data-fabact],[data-obfocus],[data-obnext],[data-obdemo],[data-obfinish],[data-copybackup],[data-saveappname],[data-restoremirror],[data-hardreload],[data-swreload],[data-addcustomcat],[data-editcustomcat],[data-delcustomcat],[data-globalsearch],[data-searchresult],[data-opencsvimport],[data-resetcsvimport],[data-runcsvimport],[data-syncsetup],[data-syncaccount],[data-syncnow],[data-synclogout],[data-syncresolve],[data-syncmerge],[data-dounlock],[data-lockmode],[data-dorecover],[data-recack],[data-reccodedone],[data-copyreccode],[data-encsetup],[data-runencsetup],[data-acctskip],[data-repeatlast],[data-quicklog],[data-ideafromworkout],[data-gotogoals],[data-cardone],[data-platfilter],[data-formatfilter],[data-psact],[data-reloaddemo],[data-ideafromentry],[data-dentry],[data-editentry],[data-eseaddset],[data-esermset],[data-clearfilters],[data-unquick],[data-addhabit],[data-edithabit],[data-delhabit],[data-togglehabit],[data-addtask],[data-edittask],[data-deltask],[data-toggletask],[data-togglemore],[data-modtoggle]');
   if(!t)return; const d=t.dataset;
 
   if(d.undo){doUndo();return;}
@@ -2835,6 +3339,71 @@ document.addEventListener('click',function(e){
     if(S.meta){S.meta.syncedAt='';}
     U.syncMsg=''; commit(); return;
   }
+  if(d.acctskip){ U.acctSkip=true; render(); return; }
+  if(d.encsetup){ U.encErr=''; U.encBackupDone=false; U.modal={type:'encsetup'}; render(); return; }
+  if(d.runencsetup){
+    if(U.encBusy||!U.encBackupDone) return;
+    const a=document.getElementById('encPw1'), b=document.getElementById('encPw2');
+    const p1=(a&&a.value)||'', p2=(b&&b.value)||'';
+    if(p1.length<6){ U.encErr='Das Passwort braucht mindestens 6 Zeichen.'; render(); return; }
+    if(p1!==p2){ U.encErr='Die beiden Passwörter stimmen nicht überein.'; render(); return; }
+    U.encBusy=true; U.encErr=''; render();
+    migrateToEncrypted(p1).then(res=>{
+      U.encBusy=false; U.encBackupDone=false;
+      U.modal={type:'recoverycode',code:res.recoveryCode};
+      render();
+    }).catch(e=>{
+      U.encBusy=false; U.encErr=e.message||'Einrichten fehlgeschlagen.'; render();
+    });
+    return;
+  }
+  if(d.recack){ U.modal.confirmed=t.checked!==undefined?t.checked:!U.modal.confirmed; render(); return; }
+  if(d.copyreccode){
+    try{ if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(d.copyreccode); }catch(e){}
+    celebrate('Code kopiert');
+    return;
+  }
+  if(d.reccodedone){
+    if(!U.modal||!U.modal.confirmed) return;
+    U.modal=null; render(); return;
+  }
+  if(d.lockmode){ U.lockMode=d.lockmode; U.lockErr=''; render(); return; }
+  if(d.dounlock){
+    if(U.lockBusy) return;
+    const el=document.getElementById('lockPw');
+    const pw=(el&&el.value)||'';
+    if(!pw){ U.lockErr='Bitte Passwort eingeben.'; render(); return; }
+    U.lockBusy=true; U.lockErr=''; render();
+    unlockAndLoad(pw).then(()=>{
+      U.lockBusy=false; U.lockErr=''; render();
+    }).catch(e=>{
+      U.lockBusy=false; U.lockErr=e.message||'Entsperren fehlgeschlagen.'; render();
+    });
+    return;
+  }
+  if(d.dorecover){
+    if(U.lockBusy) return;
+    const codeEl=document.getElementById('recCode'), pwEl=document.getElementById('recNewPw');
+    const code=(codeEl&&codeEl.value)||'', npw=(pwEl&&pwEl.value)||'';
+    if(!code||!npw){ U.lockErr='Bitte Code und neues Passwort eingeben.'; render(); return; }
+    if(npw.length<6){ U.lockErr='Das neue Passwort braucht mindestens 6 Zeichen.'; render(); return; }
+    U.lockBusy=true; U.lockErr=''; render();
+    // Erst die Daten öffnen, dann den Umschlag neu packen. Andersherum stünde
+    // man bei einem Fehler dazwischen mit einem Umschlag da, dessen Passwort
+    // niemand kennt.
+    unlockAndLoad(code,'recovery').then(()=>{
+      const env=storedEnvelope();
+      return resetPasswordWithRecovery(env,code,npw).then(r=>{
+        if(!storeEnvelope(r.envelope)) throw new Error('Der neue Schlüssel konnte nicht gespeichert werden.');
+        U.lockBusy=false; U.lockErr=''; U.lockMode='password';
+        U.modal={type:'recoverycode',code:r.recoveryCode,afterReset:true};
+        render();
+      });
+    }).catch(e=>{
+      U.lockBusy=false; U.lockErr=e.message||'Wiederherstellung fehlgeschlagen.'; render();
+    });
+    return;
+  }
   if(d.syncresolve){
     const how=d.syncresolve;
     U.modal=null; U.syncConflict=null; U.syncMergePreview=null; render();
@@ -2869,7 +3438,12 @@ document.addEventListener('click',function(e){
     celebrate(res.imported+' Ausgabe'+(res.imported===1?'':'n')+' importiert'+(res.created?' · '+res.created+' neue Kategorie'+(res.created===1?'':'n'):''));
     return;
   }
-  if(d.expjson){exportJSON();return;}
+  if(d.expjson){
+    exportJSON();
+    // Im Verschlüsselungs-Ablauf gilt der Export als erfüllte Bedingung.
+    if(U.modal&&U.modal.type==='encsetup'){ U.encBackupDone=true; render(); }
+    return;
+  }
   if(d.reloaddemo){
     if(confirm('Beispieldaten hinzufügen? Deine bestehenden Einträge bleiben erhalten.')){
       seedDemo(); commit(); celebrate('Beispieldaten hinzugefügt');
@@ -3229,6 +3803,14 @@ document.addEventListener('submit',function(e){
   else if(m.type==='syncsetup'){
     const url=g('url').trim(), key=g('anonKey').trim();
     if(!url||!key) return;
+    // Password, anon key and (later) the access token are all sent to this
+    // host. A typo'd or hostile URL would leak them, and over plain http they
+    // would travel readable on the wire - so anything but https is refused
+    // outright rather than merely warned about.
+    if(!validSyncUrl(url)){
+      U.syncMsg='Bitte eine vollständige https-Adresse eintragen, z. B. https://deinprojekt.supabase.co – andere Adressen sind nicht erlaubt, weil dorthin dein Passwort und dein Zugangs-Token gesendet würden.';
+      U.syncErr=true; render(); return;
+    }
     if(!S.settings.sync)S.settings.sync={url:'',anonKey:''};
     S.settings.sync.url=url; S.settings.sync.anonKey=key;
     U.modal=null; commit();

@@ -439,8 +439,10 @@ function e1rm(w,r){ r=Number(r)||1; return Number(w)*(1+r/30); }
 // unrelated to BLANK.version (the data-schema version used for migrations).
 // Bump this + add a line to CHANGELOG whenever a new build is shipped, so
 // it's traceable which fixes/features a given deploy actually contains.
-const APP_VERSION='1.2.0';
+const APP_VERSION='1.4.0';
 const CHANGELOG=[
+  {v:'1.4.0',notes:'Cloud-Sync führt widersprüchliche Stände jetzt feingranular zusammen (pro Eintrag), statt immer alles von einer Seite zu verwerfen. Nur Einträge, die auf beiden Geräten unterschiedlich geändert wurden, landen noch in der Konflikt-Abfrage – alles andere (neue Einträge, Änderungen nur auf einer Seite, Löschungen) wird automatisch übernommen.'},
+  {v:'1.3.0',notes:'Cloud-Sync mit eigenem Konto (E-Mail + Passwort über Supabase): Daten auf mehreren Geräten synchron halten und automatisches Backup außerhalb des Geräts. Bei widersprüchlichen Ständen fragt die App nach, statt eine Seite zu überschreiben. Einrichtung unter Einstellungen → Cloud-Sync.'},
   {v:'1.2.0',notes:'Trainingseinträge nachträglich bearbeitbar (nicht nur löschbar) · Eigene Budget- und Trainings-Kategorien anlegen/umbenennen/löschen · Volltextsuche über alle Bereiche (Lupe oben) · CSV-Import für Ausgaben mit automatischer Kategorie-Erkennung.'},
   {v:'1.1.0',notes:'Bearbeiten-Bug behoben (Werte gingen beim Antippen von Chips verloren) · Trainingseinträge einzeln löschbar · mehrstufiges Rückgängig · "Alles löschen" jetzt mit Sicherheitsnetz (Undo + Backup-Hinweis) · Update-Banner bei neuer Version · Backup-Import wird auf Plausibilität geprüft · Speichern läuft jetzt gebündelt statt bei jedem Tastendruck.'},
   {v:'1.0.0',notes:'Ursprüngliche Version.'},
@@ -454,7 +456,7 @@ const BLANK={version:2,plan:{workouts:[]},sessions:[],setup:{income:[],fixedCost
  incomeEntries:[],expenses:[],items:[],bodyweight:[],goals:[],balances:[],
  habits:[],habitLog:[],tasks:[],
  meta:{lastExport:'',changes:0,onboarded:false},
- settings:{appName:'',modules:{training:true,budget:true,content:true,habitsTab:true},customCategories:{budget:[],training:[]}}};
+ settings:{appName:'',modules:{training:true,budget:true,content:true,habitsTab:true},customCategories:{budget:[],training:[]},sync:{url:'',anonKey:''}}};
 let S=boot();
 
 function boot(){
@@ -468,6 +470,9 @@ function boot(){
     if(!n.settings)n.settings={appName:'',modules:{training:true,budget:true,content:true,habitsTab:true}};
     if(!n.settings.modules)n.settings.modules={training:true,budget:true,content:true,habitsTab:true};
     if(!n.settings.customCategories)n.settings.customCategories={budget:[],training:[]};
+    if(!n.settings.sync)n.settings.sync={url:'',anonKey:''};
+    if(n.meta.syncedAt===undefined)n.meta.syncedAt='';
+    if(n.meta.dirty===undefined)n.meta.dirty=false;
     return n;};
   try{ const raw=localStorage.getItem(KEY); if(raw) return fill(JSON.parse(raw)); }catch(e){}
   try{ const mir=localStorage.getItem(MIRROR);
@@ -531,6 +536,8 @@ function save(){
   try{
     if(!S.meta)S.meta={lastExport:'',changes:0};
     S.meta.changes=(S.meta.changes||0)+1;
+    S.meta.dirty=true;
+    if(typeof scheduleAutoSync==='function') scheduleAutoSync();
     // Coalesce rapid-fire writes (every toggle/keystroke commit) instead of
     // re-serializing + double-writing the entire app state every single time.
     // Flushed immediately if the tab is hidden/closed so nothing is lost.
@@ -641,6 +648,7 @@ function renderInner(){
   if(!S.settings)S.settings={appName:'',modules:{training:true,budget:true,content:true,habitsTab:true}};
   if(!S.settings.modules)S.settings.modules={training:true,budget:true,content:true,habitsTab:true};
   if(!S.settings.customCategories)S.settings.customCategories={budget:[],training:[]};
+  if(!S.settings.sync)S.settings.sync={url:'',anonKey:''};
   if(!S.meta.onboarded && isEmpty() && !U.obSkip){
     document.getElementById('app').innerHTML=onboardView();
     document.getElementById('bn').innerHTML='';
@@ -2000,6 +2008,314 @@ function importExpenseCsvRows(rows){
   return {imported:imported,created:created};
 }
 
+/* ===================== CLOUD SYNC (Supabase) =====================
+ * Talks directly to Supabase's REST/Auth endpoints from the browser - no
+ * build step, no serverless functions. The anon key is public by design;
+ * actual protection comes from Row Level Security on the app_state table
+ * (each row readable/writable only by its owner). Session tokens are kept
+ * in their OWN localStorage key, deliberately NOT inside S, so they never
+ * end up in an exported backup or get pushed to the cloud.
+ */
+const SESSION_KEY='alltag-hub-session';
+let SESS=loadSession();
+function loadSession(){
+  try{ const raw=localStorage.getItem(SESSION_KEY); return raw?JSON.parse(raw):null; }catch(e){ return null; }
+}
+function storeSession(x){
+  SESS=x;
+  try{ if(x) localStorage.setItem(SESSION_KEY,JSON.stringify(x)); else localStorage.removeItem(SESSION_KEY); }catch(e){}
+}
+function syncCfg(){
+  const c=(S.settings&&S.settings.sync)||{};
+  return {url:String(c.url||'').trim().replace(/\/+$/,''),key:String(c.anonKey||'').trim()};
+}
+function syncConfigured(){ const c=syncCfg(); return !!(c.url&&c.key); }
+function syncLoggedIn(){ return !!(SESS&&SESS.access_token&&SESS.user_id); }
+function sbHeaders(auth){
+  const c=syncCfg();
+  const h={'apikey':c.key,'Content-Type':'application/json'};
+  if(auth&&SESS&&SESS.access_token) h['Authorization']='Bearer '+SESS.access_token;
+  return h;
+}
+function sbRead(res){
+  return res.text().then(txt=>{
+    let body=null;
+    try{ body=txt?JSON.parse(txt):null; }catch(e){ body=txt; }
+    if(!res.ok){
+      const msg=(body&&(body.error_description||body.msg||body.message||body.error))||('Server antwortete mit HTTP '+res.status);
+      const err=new Error(msg); err.status=res.status; throw err;
+    }
+    return body;
+  });
+}
+function sbSignup(email,password){
+  return fetch(syncCfg().url+'/auth/v1/signup',{method:'POST',headers:sbHeaders(false),
+    body:JSON.stringify({email:email,password:password})}).then(sbRead).then(b=>{
+      if(b&&b.access_token){
+        storeSession({access_token:b.access_token,refresh_token:b.refresh_token,
+          user_id:b.user&&b.user.id,email:(b.user&&b.user.email)||email});
+        return {needsConfirm:false};
+      }
+      // Supabase is configured to require email confirmation - no token yet.
+      return {needsConfirm:true};
+    });
+}
+function sbLogin(email,password){
+  return fetch(syncCfg().url+'/auth/v1/token?grant_type=password',{method:'POST',headers:sbHeaders(false),
+    body:JSON.stringify({email:email,password:password})}).then(sbRead).then(b=>{
+      storeSession({access_token:b.access_token,refresh_token:b.refresh_token,
+        user_id:b.user&&b.user.id,email:(b.user&&b.user.email)||email});
+      return b;
+    });
+}
+function sbRefresh(){
+  if(!SESS||!SESS.refresh_token) return Promise.reject(new Error('Keine gespeicherte Sitzung.'));
+  return fetch(syncCfg().url+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:sbHeaders(false),
+    body:JSON.stringify({refresh_token:SESS.refresh_token})}).then(sbRead).then(b=>{
+      storeSession({access_token:b.access_token,refresh_token:b.refresh_token,
+        user_id:(b.user&&b.user.id)||SESS.user_id,email:(b.user&&b.user.email)||SESS.email});
+      return b;
+    });
+}
+function sbLogout(){ storeSession(null); }
+// Runs fn(); on an expired-token 401 refreshes once and retries.
+function sbAuthed(fn){
+  return fn().catch(e=>{
+    if(e&&e.status===401) return sbRefresh().then(fn);
+    throw e;
+  });
+}
+function cloudPull(){
+  return sbAuthed(()=>fetch(syncCfg().url+'/rest/v1/app_state?select=data,updated_at&user_id=eq.'+
+    encodeURIComponent(SESS.user_id),{headers:sbHeaders(true)})
+    .then(sbRead).then(rows=>(rows&&rows.length)?rows[0]:null));
+}
+function cloudPush(){
+  return sbAuthed(()=>{
+    const h=sbHeaders(true);
+    h['Prefer']='resolution=merge-duplicates,return=representation';
+    const payload=[{user_id:SESS.user_id,data:S,updated_at:new Date().toISOString()}];
+    return fetch(syncCfg().url+'/rest/v1/app_state',{method:'POST',headers:h,body:JSON.stringify(payload)})
+      .then(sbRead).then(rows=>(rows&&rows.length)?rows[0]:null);
+  });
+}
+// Decides what a sync should do, without doing any I/O - kept pure so it can
+// be unit-tested. serverRow may be null (nothing stored in the cloud yet).
+function syncDecision(serverRow,syncedAt,dirty){
+  if(!serverRow) return 'push';
+  if(serverRow.updated_at===syncedAt) return dirty?'push':'uptodate';
+  return dirty?'conflict':'pull';
+}
+function markSynced(serverTs){
+  if(!S.meta)S.meta={};
+  S.meta.syncedAt=serverTs||'';
+  S.meta.dirty=false;
+  flushWrite();
+  // Snapshot of the state as of this successful push/pull - the common
+  // ancestor the NEXT conflict gets 3-way-merged against. See mergeState().
+  try{ localStorage.setItem(SYNCBASE,JSON.stringify(S)); }catch(e){}
+}
+/* ---- Fine-grained (3-way) merge for cloud sync -------------------------
+ * Whole-state overwrite (always trust one side entirely) is only safe as
+ * long as at most one side changed anything since the last sync. As soon
+ * as BOTH sides changed something - even completely unrelated things, like
+ * one device logging a workout and the other adding an expense - a plain
+ * overwrite throws one of them away. SYNCBASE (see markSynced) mirrors the
+ * state as of the last successful push/pull, so a conflict can be resolved
+ * per-record: added on one side -> keep it; changed on only one side ->
+ * take that side; unchanged -> irrelevant. Only records that were BOTH
+ * changed AND ended up different count as a genuine conflict that needs a
+ * human decision - everything else merges automatically.
+ * Pure, no I/O - see the "Cloud sync" tests in tests/logic.test.js.
+ */
+const SYNCBASE='alltag-hub-v2-syncbase';
+function deepEqual(a,b){
+  if(a===b) return true;
+  if(typeof a!==typeof b||!a||!b||typeof a!=='object') return a===b;
+  if(Array.isArray(a)!==Array.isArray(b)) return false;
+  const ak=Object.keys(a),bk=Object.keys(b);
+  if(ak.length!==bk.length) return false;
+  for(let i=0;i<ak.length;i++){ const k=ak[i]; if(!Object.prototype.hasOwnProperty.call(b,k)||!deepEqual(a[k],b[k])) return false; }
+  return true;
+}
+function indexBy(arr,key){ const m={}; (arr||[]).forEach(r=>{ if(r&&r[key]!==undefined) m[r[key]]=r; }); return m; }
+// A record was edited on both sides and ended up different. If it has a
+// nested id-keyed array field (workout.exercises, session.entries) and
+// every OTHER field is identical, the "conflict" is really just two
+// independent edits inside that nested list - merge that instead of
+// forcing a whole-record decision. Anything else is a genuine conflict;
+// `prefer` ('local'|'remote'|undefined) picks the fallback side, defaulting
+// to local so nothing is silently discarded without the option to review it.
+function resolveRecordConflict(local,remote,nestedField,base,prefer){
+  if(nestedField&&Array.isArray(local[nestedField])&&Array.isArray(remote[nestedField])){
+    const rest=o=>{ const c=Object.assign({},o); delete c[nestedField]; return c; };
+    if(deepEqual(rest(local),rest(remote))){
+      const baseNested=(base&&Array.isArray(base[nestedField]))?base[nestedField]:null;
+      const nested=mergeList(baseNested,local[nestedField],remote[nestedField],'id',null,prefer);
+      if(nested.conflicts.length===0) return {merged:Object.assign({},local,{[nestedField]:nested.result}),conflict:false};
+    }
+  }
+  return {merged:prefer==='remote'?remote:local,conflict:true};
+}
+// 3-way merge of one id-keyed array (idKey defaults to 'id'; custom
+// categories use 'key'). nestedField names a nested id-keyed array on each
+// record that should be merged in turn instead of causing a hard conflict.
+function mergeList(base,local,remote,idKey,nestedField,prefer){
+  idKey=idKey||'id'; base=base||[]; local=local||[]; remote=remote||[];
+  const bi=indexBy(base,idKey),li=indexBy(local,idKey),ri=indexBy(remote,idKey);
+  const order=[],seen={};
+  local.forEach(r=>{ const k=r&&r[idKey]; if(k!==undefined&&!seen[k]){seen[k]=1;order.push(k);} });
+  remote.forEach(r=>{ const k=r&&r[idKey]; if(k!==undefined&&!seen[k]){seen[k]=1;order.push(k);} });
+  const out=[],conflicts=[];
+  const counts={addedLocal:0,addedRemote:0,removedLocal:0,removedRemote:0,changedLocal:0,changedRemote:0,conflicted:0};
+  order.forEach(id=>{
+    const b=bi[id],l=li[id],r=ri[id];
+    if(l&&r){
+      if(!b){
+        if(deepEqual(l,r)){ out.push(l); return; }
+        const c=resolveRecordConflict(l,r,nestedField,b,prefer);
+        out.push(c.merged); if(c.conflict){ conflicts.push({id,local:l,remote:r}); counts.conflicted++; }
+        return;
+      }
+      const lc=!deepEqual(b,l),rc=!deepEqual(b,r);
+      if(!lc&&!rc){ out.push(b); return; }
+      if(lc&&!rc){ out.push(l); counts.changedLocal++; return; }
+      if(!lc&&rc){ out.push(r); counts.changedRemote++; return; }
+      if(deepEqual(l,r)){ out.push(l); return; }
+      const c=resolveRecordConflict(l,r,nestedField,b,prefer);
+      out.push(c.merged);
+      if(c.conflict){ conflicts.push({id,local:l,remote:r}); counts.conflicted++; }
+      else { counts.changedLocal++; counts.changedRemote++; }
+      return;
+    }
+    if(l&&!r){
+      if(!b){ out.push(l); counts.addedLocal++; return; }
+      if(deepEqual(b,l)){ counts.removedRemote++; return; } // remote deleted it, local left it alone -> respect the deletion
+      conflicts.push({id,local:l,remote:null,deletedRemote:true}); counts.conflicted++;
+      if(prefer==='remote') counts.removedRemote++; else out.push(l); // local edited what remote deleted
+      return;
+    }
+    if(!l&&r){
+      if(!b){ out.push(r); counts.addedRemote++; return; }
+      if(deepEqual(b,r)){ counts.removedLocal++; return; }
+      conflicts.push({id,local:null,remote:r,deletedLocal:true}); counts.conflicted++;
+      if(prefer==='local') counts.removedLocal++; else out.push(r); // remote edited what local deleted
+      return;
+    }
+  });
+  return {result:out,conflicts,counts};
+}
+function getPath(obj,path){ return path.reduce((o,k)=>(o&&o[k]!==undefined)?o[k]:undefined,obj); }
+function setPath(obj,path,val){ let o=obj; for(let i=0;i<path.length-1;i++){ if(!o[path[i]])o[path[i]]={}; o=o[path[i]]; } o[path[path.length-1]]=val; }
+// Every id-keyed collection in the schema that sync touches. nested names a
+// nested id-keyed array field that should be merged in turn (see above).
+const MERGE_COLLECTIONS=[
+  {path:['sessions'],nested:'entries'},
+  {path:['incomeEntries']},
+  {path:['expenses']},
+  {path:['items']},
+  {path:['bodyweight']},
+  {path:['goals']},
+  {path:['balances']},
+  {path:['habits']},
+  {path:['habitLog']},
+  {path:['tasks']},
+  {path:['plan','workouts'],nested:'exercises'},
+  {path:['setup','income']},
+  {path:['setup','fixedCosts']},
+  {path:['settings','customCategories','budget'],idKey:'key'},
+  {path:['settings','customCategories','training'],idKey:'key'},
+];
+// Top-level entry point: 3-way-merges every collection above and returns
+// the merged state plus a full list of genuine per-record conflicts (empty
+// = safe to apply automatically) and counts for a human-readable summary.
+function mergeState(base,local,remote,prefer){
+  const merged=JSON.parse(JSON.stringify(local));
+  const conflicts=[];
+  const counts={addedLocal:0,addedRemote:0,removedLocal:0,removedRemote:0,changedLocal:0,changedRemote:0,conflicted:0};
+  MERGE_COLLECTIONS.forEach(c=>{
+    const b=getPath(base,c.path),l=getPath(local,c.path),r=getPath(remote,c.path);
+    const res=mergeList(b,l,r,c.idKey,c.nested,prefer);
+    setPath(merged,c.path,res.result);
+    res.conflicts.forEach(cf=>conflicts.push(Object.assign({collection:c.path.join('.')},cf)));
+    Object.keys(counts).forEach(k=>counts[k]+=res.counts[k]);
+  });
+  return {merged,conflicts,counts};
+}
+function mergeSummaryMsg(counts){
+  const parts=[];
+  if(counts.addedRemote) parts.push(counts.addedRemote+' von der Cloud übernommen');
+  if(counts.addedLocal) parts.push(counts.addedLocal+' lokal hinzugefügt');
+  if(counts.changedRemote) parts.push(counts.changedRemote+' aus der Cloud aktualisiert');
+  if(counts.changedLocal) parts.push(counts.changedLocal+' lokale Änderung'+(counts.changedLocal===1?'':'en')+' behalten');
+  if(counts.removedRemote) parts.push(counts.removedRemote+' entfernt (in der Cloud gelöscht)');
+  if(counts.removedLocal) parts.push(counts.removedLocal+' entfernt (lokal gelöscht)');
+  if(counts.conflicted) parts.push(counts.conflicted+' Konflikt'+(counts.conflicted===1?'':'e')+' aufgelöst');
+  return parts.length?('Zusammengeführt: '+parts.join(' · ')+'.'):'Zusammengeführt – keine inhaltlichen Unterschiede.';
+}
+function applyRemote(row){
+  const d=row&&row.data;
+  if(!d||typeof d!=='object') throw new Error('Die Cloud enthält keine gültigen Daten.');
+  if(typeof d.version==='number'&&d.version>BLANK.version)
+    throw new Error('Die Cloud-Daten stammen aus einer neueren App-Version. Bitte zuerst die App aktualisieren.');
+  validateBackupShape(d);
+  const next=d.version===BLANK.version?Object.assign(JSON.parse(JSON.stringify(BLANK)),d):migrate(d);
+  const prev=S;
+  S=next;
+  if(!render()){ S=prev; render(); throw new Error('Die Cloud-Daten konnten nicht geladen werden.'); }
+  markSynced(row.updated_at);
+  render();
+}
+let syncBusy=false;
+function setSyncMsg(msg,isError){
+  U.syncMsg=msg||''; U.syncErr=!!isError;
+  const el=document.getElementById('modal');
+  if(el&&U.modal) el.innerHTML=mSheet();
+}
+// force: 'local' pushes local over cloud, 'cloud' adopts cloud, undefined = auto
+function doSync(force){
+  if(!syncConfigured()) return Promise.resolve({action:'unconfigured'});
+  if(!syncLoggedIn()) return Promise.resolve({action:'loggedout'});
+  if(syncBusy) return Promise.resolve({action:'busy'});
+  syncBusy=true; setSyncMsg('Synchronisiere …');
+  return cloudPull().then(row=>{
+    let action=force==='local'?'push':force==='cloud'?'pull':syncDecision(row,(S.meta&&S.meta.syncedAt)||'',!!(S.meta&&S.meta.dirty));
+    if(action==='pull'&&!row) action='push';
+    if(action==='uptodate'){ setSyncMsg('Alles aktuell.'); return {action:'uptodate'}; }
+    if(action==='conflict'){
+      let baseSnap=null;
+      try{ const raw=localStorage.getItem(SYNCBASE); if(raw) baseSnap=JSON.parse(raw); }catch(e){}
+      // No snapshot yet (first conflict after updating to 1.4.0, or a device
+      // that has never completed a sync)? Then merge against an EMPTY base
+      // instead of giving up. Consequence: nothing can be inferred as
+      // "deleted on the other side", so no record is ever dropped - both
+      // sides' entries are unioned and only same-id records that actually
+      // differ still count as a conflict. Strictly safer than the old
+      // all-or-nothing choice, which silently discarded one whole side.
+      const mp=mergeState(baseSnap||{},S,row.data);
+      if(mp.conflicts.length===0){
+        const prevS=S;
+        S=mp.merged;
+        if(!render()){ S=prevS; render(); U.syncConflict=row; setSyncMsg('',false); U.modal={type:'syncconflict'}; render(); return {action:'conflict'}; }
+        return cloudPush().then(saved=>{ markSynced(saved&&saved.updated_at); setSyncMsg(mergeSummaryMsg(mp.counts)); render(); return {action:'merged',counts:mp.counts}; });
+      }
+      U.syncConflict=row; U.syncMergePreview=mp; setSyncMsg('',false); U.modal={type:'syncconflict'}; render();
+      return {action:'conflict',conflicts:mp.conflicts.length};
+    }
+    if(action==='pull'){ applyRemote(row); setSyncMsg('Von der Cloud geladen.'); return {action:'pulled'}; }
+    return cloudPush().then(saved=>{ markSynced(saved&&saved.updated_at); setSyncMsg('In die Cloud gesichert.'); render(); return {action:'pushed'}; });
+  }).catch(e=>{
+    setSyncMsg(e.message||'Synchronisieren fehlgeschlagen.',true);
+    return {action:'error',error:e};
+  }).then(r=>{ syncBusy=false; return r; });
+}
+let autoSyncTimer=null;
+function scheduleAutoSync(){
+  if(!syncConfigured()||!syncLoggedIn()) return;
+  clearTimeout(autoSyncTimer);
+  autoSyncTimer=setTimeout(()=>{ doSync(); },6000);
+}
+
 /* ===================== GLOBAL SEARCH ===================== */
 function globalSearch(q){
   q=(q||'').toLowerCase().trim();
@@ -2067,6 +2383,56 @@ function picks(field,opts,cur,colorOf){
 }
 function mSheet(){
   const m=U.modal;
+  if(m.type==='syncsetup'){
+    const c=syncCfg();
+    return sheet('Cloud-Sync einrichten',
+     '<div class="panel-s" style="margin:0 0 12px">Diese beiden Werte findest du in deinem Supabase-Projekt unter <strong>Project Settings → API</strong>. Der anon-Key ist ein öffentlicher Schlüssel – er darf in der App stehen, deine Daten sind trotzdem geschützt, weil der Server nur eigene Zeilen freigibt.</div>'+
+     '<label class="lab" style="margin-top:0">Project URL</label>'+
+     '<input class="f" name="url" value="'+esc(c.url)+'" placeholder="https://xxxxxxxx.supabase.co" required>'+
+     '<label class="lab">anon public key</label>'+
+     '<textarea class="f" name="anonKey" placeholder="eyJhbGciOi…" required>'+esc(c.key)+'</textarea>'+
+     '<button type="submit" class="btn grad" style="margin-top:22px">Speichern</button>');
+  }
+  if(m.type==='syncaccount'){
+    const mode=m.mode||'login';
+    return sheet(mode==='login'?'Anmelden':'Konto erstellen',
+     '<div class="chips" style="margin-bottom:4px">'+
+       '<button type="button" class="chip" data-pick="mode|login" style="flex:1'+(mode==='login'?';background:'+VIOLET+'22;border-color:'+VIOLET+';color:#fff':'')+'">Anmelden</button>'+
+       '<button type="button" class="chip" data-pick="mode|signup" style="flex:1'+(mode==='signup'?';background:'+VIOLET+'22;border-color:'+VIOLET+';color:#fff':'')+'">Neues Konto</button>'+
+     '</div>'+
+     '<label class="lab">E-Mail</label>'+
+     '<input class="f" name="email" type="email" autocomplete="email" value="'+esc(m.email||'')+'" required>'+
+     '<label class="lab">Passwort</label>'+
+     '<input class="f" name="password" type="password" autocomplete="'+(mode==='login'?'current-password':'new-password')+'" required>'+
+     (mode==='signup'?'<div class="panel-s" style="margin-top:8px">Mindestens 6 Zeichen. Je nach Projekteinstellung musst du die Adresse per E-Mail bestätigen, bevor die Anmeldung klappt.</div>':'')+
+     (U.syncMsg?'<div class="panel-s" style="color:'+(U.syncErr?BAD:GOOD)+'">'+esc(U.syncMsg)+'</div>':'')+
+     '<button type="submit" class="btn grad" style="margin-top:22px">'+(mode==='login'?'Anmelden':'Konto erstellen')+'</button>');
+  }
+  if(m.type==='syncconflict'){
+    const row=U.syncConflict;
+    const serverTs=row&&row.updated_at?new Date(row.updated_at).toLocaleString('de-DE'):'unbekannt';
+    const prev=U.syncMergePreview;
+    const n=prev?prev.conflicts.length:0;
+    const auto=prev?(prev.counts.addedRemote+prev.counts.addedLocal+prev.counts.changedRemote+prev.counts.changedLocal+prev.counts.removedRemote+prev.counts.removedLocal):0;
+    return sheet('Unterschiedliche Stände',
+     '<div class="panel-s" style="margin:0 0 12px">In der Cloud liegt ein anderer Stand (gespeichert am '+esc(serverTs)+'), und gleichzeitig gibt es hier lokale Änderungen.'+
+      (prev?(' Bei '+n+' '+(n===1?'Eintrag':'Einträgen')+' wurde auf beiden Seiten etwas geändert – das lässt sich nicht automatisch entscheiden.'+
+        (auto?(' Die restlichen '+auto+' Änderung'+(auto===1?'':'en')+' lassen sich problemlos automatisch zusammenführen.'):'')):
+       ' Beides automatisch zusammenzuführen wäre Raterei – deshalb entscheidest du.')+
+     '</div>'+
+     '<div class="panel-s" style="margin-bottom:12px">Sichere dir vorher am besten ein Backup, dann ist nichts endgültig weg.</div>'+
+     '<button type="button" class="btn ghost" data-expjson="1">'+ic('dl','sm')+' Backup dieser Version sichern</button>'+
+     '<div style="height:14px"></div>'+
+     (prev?(
+      '<button type="button" class="btn grad" data-syncmerge="local">'+ic('check','sm')+' Zusammenführen – bei Konflikten meine Version</button>'+
+      '<div style="height:8px"></div>'+
+      '<button type="button" class="btn ghost" data-syncmerge="remote">'+ic('check','sm')+' Zusammenführen – bei Konflikten Cloud-Version</button>'+
+      '<div style="height:14px"></div>'
+     ):'')+
+     '<button type="button" class="btn ghost" data-syncresolve="cloud">'+ic('dl','sm')+' '+(prev?'Alles aus der Cloud übernehmen (verwirft alle lokalen Änderungen)':'Cloud-Version übernehmen')+'</button>'+
+     '<div style="height:8px"></div>'+
+     '<button type="button" class="btn ghost" data-syncresolve="local">'+ic('ul','sm')+' '+(prev?'Alles hochladen (verwirft die Cloud-Version)':'Meine Version hochladen')+'</button>');
+  }
   if(m.type==='csvimport'){
     const rows=m.rows;
     let inner='<div class="panel-s" style="margin:0 0 12px">CSV mit Ausgaben importieren. Erwartete Spalten: Datum, Bezeichnung, Kategorie, Betrag (Semikolon oder Komma getrennt) – eine Kopfzeile ist optional. Unbekannte Kategorien werden automatisch als eigene Budget-Kategorie angelegt.</div>';
@@ -2173,6 +2539,23 @@ function mSheet(){
      '<button type="button" class="btn ghost" data-copybackup="1">'+ic('layers','sm')+' In Zwischenablage kopieren</button>'+
      '<div style="height:8px"></div>'+
      '<label class="btn ghost" style="margin:0"><input type="file" id="impf" accept="application/json,.json" style="display:none">'+ic('ul','sm')+' Backup importieren</label></div>'+
+     '<div class="panel"><div class="panel-t">Cloud-Sync</div>'+
+     (!syncConfigured()
+       ? '<div class="panel-s">Noch nicht eingerichtet. Mit einem kostenlosen Supabase-Projekt kannst du deine Daten auf mehreren Geräten synchron halten und hast automatisch ein Backup außerhalb dieses Geräts.</div>'+
+         '<button type="button" class="btn ghost" data-syncsetup="1">'+ic('layers','sm')+' Einrichten</button>'
+       : (!syncLoggedIn()
+         ? '<div class="panel-s">Verbunden mit dem Projekt, aber nicht angemeldet.</div>'+
+           '<button type="button" class="btn grad" data-syncaccount="1">'+ic('layers','sm')+' Anmelden oder Konto erstellen</button>'+
+           '<div style="height:8px"></div>'+
+           '<button type="button" class="btn ghost" data-syncsetup="1">Zugangsdaten ändern</button>'
+         : '<div class="panel-s">Angemeldet als '+esc(SESS.email||'')+'.'+
+             ((S.meta&&S.meta.syncedAt)?' Zuletzt synchronisiert: '+esc(new Date(S.meta.syncedAt).toLocaleString('de-DE'))+'.':' Noch nie synchronisiert.')+
+             ((S.meta&&S.meta.dirty)?' Es gibt lokale Änderungen, die noch nicht in der Cloud sind.':'')+'</div>'+
+           (U.syncMsg?'<div class="panel-s" style="color:'+(U.syncErr?BAD:GOOD)+'">'+esc(U.syncMsg)+'</div>':'')+
+           '<button type="button" class="btn grad" data-syncnow="1">'+ic('repeat','sm')+' Jetzt synchronisieren</button>'+
+           '<div style="height:8px"></div>'+
+           '<button type="button" class="btn ghost" data-synclogout="1">Abmelden</button>'))+
+     '</div>'+
      '<div class="panel"><div class="panel-t">CSV-Import (Ausgaben)</div>'+
      '<div class="panel-s">Ausgaben aus einer Excel-/Bank-CSV importieren. Unbekannte Kategorien werden automatisch als eigene Kategorie angelegt.</div>'+
      '<button type="button" class="btn ghost" data-opencsvimport="1">'+ic('ul','sm')+' CSV auswählen</button></div>'+
@@ -2411,7 +2794,7 @@ function mSheet(){
 /* ===================== EVENTS ===================== */
 document.addEventListener('click',function(e){
   if(e.target.id==='ov'){U.modal=null;render();return;}
-  const t=e.target.closest('[data-tab],[data-ts],[data-bs],[data-cs],[data-tog],[data-aw],[data-ew],[data-dw],[data-ae],[data-ee],[data-de],[data-savesess],[data-prog],[data-metric],[data-abw],[data-dbw],[data-mo],[data-ai],[data-ei],[data-di],[data-aie],[data-eie],[data-die],[data-af],[data-ef],[data-df],[data-ax],[data-ex],[data-dx],[data-ag],[data-eg],[data-dg],[data-as],[data-ai2],[data-eit],[data-mv],[data-day],[data-mclose],[data-pick],[data-dtog],[data-mdel],[data-settings],[data-expjson],[data-taxexport],[data-reset],[data-resetconfirm],[data-addset],[data-rmset],[data-timer],[data-stoptimer],[data-bizchk],[data-undo],[data-rpe],[data-reconcile],[data-balsave],[data-balbook],[data-dbal],[data-tpl],[data-fab],[data-fabact],[data-obfocus],[data-obnext],[data-obdemo],[data-obfinish],[data-copybackup],[data-saveappname],[data-restoremirror],[data-hardreload],[data-swreload],[data-addcustomcat],[data-editcustomcat],[data-delcustomcat],[data-globalsearch],[data-searchresult],[data-opencsvimport],[data-resetcsvimport],[data-runcsvimport],[data-repeatlast],[data-quicklog],[data-ideafromworkout],[data-gotogoals],[data-cardone],[data-platfilter],[data-formatfilter],[data-psact],[data-reloaddemo],[data-ideafromentry],[data-dentry],[data-editentry],[data-eseaddset],[data-esermset],[data-clearfilters],[data-unquick],[data-addhabit],[data-edithabit],[data-delhabit],[data-togglehabit],[data-addtask],[data-edittask],[data-deltask],[data-toggletask],[data-togglemore],[data-modtoggle]');
+  const t=e.target.closest('[data-tab],[data-ts],[data-bs],[data-cs],[data-tog],[data-aw],[data-ew],[data-dw],[data-ae],[data-ee],[data-de],[data-savesess],[data-prog],[data-metric],[data-abw],[data-dbw],[data-mo],[data-ai],[data-ei],[data-di],[data-aie],[data-eie],[data-die],[data-af],[data-ef],[data-df],[data-ax],[data-ex],[data-dx],[data-ag],[data-eg],[data-dg],[data-as],[data-ai2],[data-eit],[data-mv],[data-day],[data-mclose],[data-pick],[data-dtog],[data-mdel],[data-settings],[data-expjson],[data-taxexport],[data-reset],[data-resetconfirm],[data-addset],[data-rmset],[data-timer],[data-stoptimer],[data-bizchk],[data-undo],[data-rpe],[data-reconcile],[data-balsave],[data-balbook],[data-dbal],[data-tpl],[data-fab],[data-fabact],[data-obfocus],[data-obnext],[data-obdemo],[data-obfinish],[data-copybackup],[data-saveappname],[data-restoremirror],[data-hardreload],[data-swreload],[data-addcustomcat],[data-editcustomcat],[data-delcustomcat],[data-globalsearch],[data-searchresult],[data-opencsvimport],[data-resetcsvimport],[data-runcsvimport],[data-syncsetup],[data-syncaccount],[data-syncnow],[data-synclogout],[data-syncresolve],[data-syncmerge],[data-repeatlast],[data-quicklog],[data-ideafromworkout],[data-gotogoals],[data-cardone],[data-platfilter],[data-formatfilter],[data-psact],[data-reloaddemo],[data-ideafromentry],[data-dentry],[data-editentry],[data-eseaddset],[data-esermset],[data-clearfilters],[data-unquick],[data-addhabit],[data-edithabit],[data-delhabit],[data-togglehabit],[data-addtask],[data-edittask],[data-deltask],[data-toggletask],[data-togglemore],[data-modtoggle]');
   if(!t)return; const d=t.dataset;
 
   if(d.undo){doUndo();return;}
@@ -2426,7 +2809,7 @@ document.addEventListener('click',function(e){
   }
   if(d.hardreload){ location.reload(); return; }
   if(d.swreload){ location.reload(); return; }
-  if(d.mclose){U.modal=null;render();return;}
+  if(d.mclose){U.modal=null;U.syncMergePreview=null;render();return;}
   if(d.bizchk!==undefined){ U.modal.business=t.checked!==undefined?t.checked:!U.modal.business; return; }
   if(d.pick){const[f,v]=d.pick.split('|');stash();
     if(f==='recurring')U.modal.recurring=(v==='yes');else U.modal[f]=v;render();return;}
@@ -2444,6 +2827,37 @@ document.addEventListener('click',function(e){
   if(d.settings){U.modal={type:'settings'};render();return;}
   if(d.globalsearch){U.searchGlobal=U.searchGlobal||'';U.modal={type:'globalsearch'};render();return;}
   if(d.searchresult){const[kind,id]=d.searchresult.split('|');openSearchResult(kind,id);return;}
+  if(d.syncsetup){U.syncMsg='';U.modal={type:'syncsetup'};render();return;}
+  if(d.syncaccount){U.syncMsg='';U.modal={type:'syncaccount',mode:'login'};render();return;}
+  if(d.syncnow){U.syncMsg='';doSync();render();return;}
+  if(d.synclogout){
+    sbLogout();
+    if(S.meta){S.meta.syncedAt='';}
+    U.syncMsg=''; commit(); return;
+  }
+  if(d.syncresolve){
+    const how=d.syncresolve;
+    U.modal=null; U.syncConflict=null; U.syncMergePreview=null; render();
+    doSync(how);
+    return;
+  }
+  if(d.syncmerge){
+    const prefer=d.syncmerge;
+    const row=U.syncConflict;
+    let baseSnap=null;
+    try{ const raw=localStorage.getItem(SYNCBASE); if(raw) baseSnap=JSON.parse(raw); }catch(e){}
+    U.modal=null; U.syncConflict=null; U.syncMergePreview=null;
+    if(!row){ render(); return; }
+    const mp=mergeState(baseSnap||{},S,row.data,prefer);
+    const prevS=S;
+    S=mp.merged;
+    if(!render()){ S=prevS; setSyncMsg('Zusammenführen fehlgeschlagen.',true); render(); return; }
+    syncBusy=true; setSyncMsg('Synchronisiere …'); render();
+    cloudPush().then(saved=>{
+      markSynced(saved&&saved.updated_at); syncBusy=false; setSyncMsg(mergeSummaryMsg(mp.counts)); render();
+    }).catch(e=>{ syncBusy=false; setSyncMsg(e.message||'Zusammenführen fehlgeschlagen.',true); render(); });
+    return;
+  }
   if(d.opencsvimport){U.modal={type:'csvimport'};render();return;}
   if(d.resetcsvimport){U.modal={type:'csvimport'};render();return;}
   if(d.runcsvimport){
@@ -2812,6 +3226,34 @@ document.addEventListener('submit',function(e){
     }
     en.note=g('note').trim();
   }
+  else if(m.type==='syncsetup'){
+    const url=g('url').trim(), key=g('anonKey').trim();
+    if(!url||!key) return;
+    if(!S.settings.sync)S.settings.sync={url:'',anonKey:''};
+    S.settings.sync.url=url; S.settings.sync.anonKey=key;
+    U.modal=null; commit();
+    U.syncMsg=''; U.modal={type:'syncaccount',mode:'login'}; render();
+    return;
+  }
+  else if(m.type==='syncaccount'){
+    const email=g('email').trim(), pw=g('password');
+    if(!email||!pw) return;
+    const mode=m.mode||'login';
+    U.syncMsg='Bitte warten …'; U.syncErr=false; render();
+    const done=()=>{ U.syncMsg=''; U.modal=null; commit(); doSync(); };
+    const fail=e=>{ U.syncMsg=e.message||'Fehlgeschlagen.'; U.syncErr=true; render(); };
+    if(mode==='signup'){
+      sbSignup(email,pw).then(r=>{
+        if(r.needsConfirm){
+          U.syncMsg='Konto angelegt. Bestätige zuerst die E-Mail, dann kannst du dich anmelden.';
+          U.syncErr=false; U.modal={type:'syncaccount',mode:'login',email:email}; render();
+        } else done();
+      }).catch(fail);
+    } else {
+      sbLogin(email,pw).then(done).catch(fail);
+    }
+    return;
+  }
   else if(m.type==='customcat'){
     const kind=m.kind;
     const label=g('label').trim();
@@ -2974,6 +3416,13 @@ if('serviceWorker' in navigator){
 
 /* ===================== INIT ===================== */
 render();
+// If a cloud session already exists, reconcile with the server shortly after
+// startup. Deliberately non-blocking and failure-tolerant: the app is
+// offline-first and must stay fully usable if the network or the cloud
+// project is unavailable.
+if(syncConfigured()&&syncLoggedIn()){
+  setTimeout(()=>{ try{ doSync(); }catch(e){ console.error('Sync beim Start fehlgeschlagen:',e); } },1200);
+}
 </script>
 </body>
 </html>

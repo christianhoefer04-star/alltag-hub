@@ -1,4 +1,4 @@
-const CACHE = 'alltag-hub-v7';
+const CACHE = 'alltag-hub-v8';
 const ASSETS = ['./', './index.html', './manifest.json', './icon.png', './version.txt'];
 
 self.addEventListener('install', e => {
